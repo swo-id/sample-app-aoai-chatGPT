@@ -41,8 +41,8 @@ cosmos_client = CosmosClient(
     credential=os.getenv("COSMOS_DB_KEY")
 )
 
-database_id = "permitMetadataDB"
-container_id = "newPermitMetadataContainer"
+database_id = os.getenv("AZURE_COSMOSDB_PERMIT_DATABASE")
+container_id = os.getenv("AZURE_COSMOSDB_PERMIT_CONTAINER")
 
 database = cosmos_client.get_database_client(database_id)
 container = database.get_container_client(container_id)
@@ -102,15 +102,6 @@ retrieval_client = AzureAISearch(
 # Multi-source search client for improved retrieval flow
 multi_search_client = MultiSourceSearch()
 
-cosmos_client = CosmosClient(
-    url=os.getenv("COSMOS_DB_URI"),
-    credential=os.getenv("COSMOS_DB_KEY")
-)
-
-database_id = "permitMetadataDB"
-container_id = "permitMetadataContainer"
-
-
 class AgentResponse(BaseModel):
     """
     Response from the agent.
@@ -152,7 +143,7 @@ async def get_permit_document_content(keyword: str):
             search_results = await retrieval_client.semantic_ranking_search(
                 keyword=keyword,
                 k=10,
-                select_fields=["title", "content"]
+                select_fields=["title", "content", "filepath", "chunkingId", "pagePriority"]
             )
         else:
             # Step 2: Search content with document filtering
@@ -162,10 +153,19 @@ async def get_permit_document_content(keyword: str):
                 k=10
             )
 
-        docs = [doc.get('content', '') for doc in search_results.get('value', [])]
-        title = [doc.get('title', '') for doc in search_results.get('value', [])]
-
-        return "\n".join([f"{t}: {d}" for t, d in zip(title, docs) if t and d])
+        # Extract content with proper metadata
+        results = []
+        for doc in search_results.get('value', []):
+            title = doc.get('title', '')
+            content = doc.get('content', '')
+            filepath = doc.get('filepath', '')
+            chunking_id = doc.get('chunkingId', 0)
+            
+            if title and content:
+                # Format with proper citation as expected by system message
+                results.append(f"[{filepath}, Page {chunking_id}]: {content}")
+        
+        return "\n\n".join(results) if results else f"No relevant content found for: {keyword}"
 
     except Exception as e:
         print(f"Error in get_permit_document_content: {e}")
@@ -173,13 +173,22 @@ async def get_permit_document_content(keyword: str):
         search_results = await retrieval_client.semantic_ranking_search(
             keyword=keyword,
             k=10,
-            select_fields=["title", "content"]
+            select_fields=["title", "content", "filepath", "chunkingId", "pagePriority"]
         )
 
-        docs = [doc.get('content', '') for doc in search_results.get('value', [])]
-        title = [doc.get('title', '') for doc in search_results.get('value', [])]
-
-        return "\n".join([f"{t}: {d}" for t, d in zip(title, docs) if t and d])
+        # Extract content with proper metadata (fallback)
+        results = []
+        for doc in search_results.get('value', []):
+            title = doc.get('title', '')
+            content = doc.get('content', '')
+            filepath = doc.get('filepath', '')
+            chunking_id = doc.get('chunkingId', 0)
+            
+            if title and content:
+                # Format with proper citation as expected by system message
+                results.append(f"[{filepath}, Page {chunking_id}]: {content}")
+        
+        return "\n\n".join(results) if results else f"No relevant content found for: {keyword}"
 
 
 @tool

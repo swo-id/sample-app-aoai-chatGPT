@@ -267,7 +267,7 @@ class MultiSourceSearch:
             content_results = await self.content_client.semantic_ranking_search(
                 keyword=keyword,
                 k=k,
-                select_fields=["title", "content", "filepath"],
+                select_fields=["title", "content", "filepath", "chunkingId", "pagePriority"],
                 filter_expression=filter_expression
             )
 
