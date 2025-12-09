@@ -2,15 +2,13 @@ import os
 
 from datetime import datetime
 from src.permit_agent.backend import AzureAISearch
+from src.utils.config import AgentConfiguration
 
 from pydantic import BaseModel, Field
 
 from langchain_core.tools import tool, Tool
 from langchain_openai import AzureChatOpenAI
 from langgraph.prebuilt import create_react_agent
-
-from langfuse import get_client
-from langfuse.langchain import CallbackHandler
 
 from typing import Optional, Literal
 
@@ -21,13 +19,6 @@ from openai import OpenAI
 from azure.cosmos import CosmosClient
 
 load_dotenv()
-
-os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-a92829d1-413f-4994-af78-f3a336efce8a"
-os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-60f090e3-f692-4515-8625-cd4b417e9d71"
-os.environ["LANGFUSE_HOST"] = "http://localhost:3000"
- 
-langfuse = get_client()
-langfuse_handler = CallbackHandler()
 
 METADATA_DATABASE = "data/metadata_document.db"
 cosmos_client = CosmosClient(
@@ -41,36 +32,15 @@ container_id = "permitMetadataContainer"
 database = cosmos_client.get_database_client(database_id)
 container = database.get_container_client(container_id)
 
- 
-try:
-    langfuse.auth_check()
-    print("Langfuse client is authenticated and ready!")
-except Exception as e:
-    print(f"Authentication failed: {e}")
+config_agent = AgentConfiguration()
 
 EMBEDDINGS_MODEL = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME")
-AZURE_OPENAI_SYSTEM_MESSAGE = """
-        You are a knowledgeable assistant that answers questions using the context provided from PDF pages. Each page is represented by a chunk with a title (derived from the filename)
-        When answering:
-          - Use the provided context to support your response.
-          - filter the context if document title is part of the questions and omit the main answer from another document title.
-          - Always include inline citations that reference the source page by including the document title and chunkingId in square brackets (e.g., [DocumentName, Page 0]).
-          - Only process the information by the same page first then continue to another page.
-          - If the retrieved context does not fully answer the query, state that the answer is based on the available context and may be incomplete.
-          - Answer in point form if the question asks for list of items.
-          - You are provided with multiple tools to assist you in answering questions. Use that tools.
 
-        Main Knowledge:
-        - Organization that available: PPN, PGN, KPI, SHU
-
-          
-        Answer the user’s query as accurately as possible by the most relevance title while directly referencing the relevant pages.
-          
-          """
+AZURE_OPENAI_SYSTEM_MESSAGE = config_agent.get_prompt(prompt_name='agent')
 
 llm = AzureChatOpenAI(
-    azure_deployment="gpt-4.1",
-    api_version="2024-12-01-preview",
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     temperature=0,
     max_tokens=1000,
     timeout=500,
@@ -88,13 +58,29 @@ retrieval_client = AzureAISearch(
     index_name=os.getenv("AZURE_AI_SEARCH_INDEX_NAME")
     )
 
+title_search_client = AzureAISearch(
+    base_url=os.getenv("AZURE_AI_SEARCH_ENDPOINT"),
+    index_name=os.getenv("AZURE_AI_SEARCH_TITLE_INDEX_NAME"),
+    api_version=os.getenv("AZURE_AI_SEARCH_API_VERSION"),
+    api_key=os.getenv("AZURE_AI_SEARCH_API_KEY") 
+)
+
 cosmos_client = CosmosClient(
     url=os.getenv("COSMOS_DB_URI"),
     credential=os.getenv("COSMOS_DB_KEY")
 )
 
-database_id = "permitMetadataDB"
-container_id = "permitMetadataContainer"
+# Get main organizations list from distinct organizations in the database
+query = """
+        SELECT DISTINCT TOP 20 c.organization
+        FROM c
+        """
+results = container.query_items(
+    query=query,
+    enable_cross_partition_query=True
+)
+
+MAIN_ORGANIZATIONS = [item['organization'] for item in results]
 
 class AgentResponse(BaseModel):
     """
@@ -143,24 +129,8 @@ def get_current_date():
 
     return datetime.now().strftime("%Y-%m-%d")
 
-
 @tool
-def get_time_difference(now_datetime: str, expired_datetime: str):
-    """
-    Calculate time difference between now and permit expiration
-
-    Args:
-        now_datetime (str): Current date with YYYY-mm-dd format.
-        expired_datetime (str): Document expiration date with YYYY-mm-dd format.
-    """
-
-    now = datetime.strptime(now_datetime, "%Y-%m-%d")
-    expired = datetime.strptime(expired_datetime, "%Y-%m-%d")
-    delta = expired - now
-    return delta.days
-
-@tool
-def get_list_documents_by_issue_year(
+async def get_list_documents_by_issue_year(
                 permit_type: Literal['PLO', 'KKPR/KKPRL', 'Ijin Lingkungan'] = None,
                 year: int = None,
                 organization: Optional[str] = None, 
@@ -190,6 +160,10 @@ def get_list_documents_by_issue_year(
         parameters.append(dict(name="@permitType", value=permit_type))
 
     if operator:
+
+        if year is None:
+            year = datetime.now().year
+
         parameters.append(dict(name="@year", value=year))
         
         if operator == 'greater':
@@ -200,8 +174,21 @@ def get_list_documents_by_issue_year(
             conditions.append("YEAR(p.issueDate) = @year")
         
     if organization:
-        conditions.append("c.organization = @organization")
-        parameters.append(dict(name="@organization", value=organization))
+        if organization.strip() in MAIN_ORGANIZATIONS:
+            conditions.append("c.organization = @organization")
+            parameters.append(dict(name="@organization", value=organization))
+        else:
+            title_file_search = await title_search_client.full_text_search(
+                keyword=organization.strip(),
+                select_fields=["title", "titleWithExtension"],
+                search_fields=["title", "titleWithExtension"],
+                top=10
+            )
+
+            list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
+            title_str = ",".join([f"'{t}'" for t in list_of_titles])
+            conditions.append(f"c.documentTitle IN ({title_str})")
+
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -233,7 +220,7 @@ def get_list_documents_by_issue_year(
     return "\n".join(result_list)
 
 @tool
-def get_list_documents_by_expiration_year(
+async def get_list_documents_by_expiration_year(
                 permit_type: Literal['PLO'] = None,
                 year: int = None,
                 organization: Optional[str] = None, 
@@ -265,6 +252,8 @@ def get_list_documents_by_expiration_year(
         parameters.append(dict(name="@permitType", value=permit_type))
 
     if operator:
+        if year is None:
+            year = datetime.now().year
         parameters.append(dict(name="@year", value=year))
         
         if operator == 'greater':
@@ -276,8 +265,20 @@ def get_list_documents_by_expiration_year(
     
 
     if organization:
-        conditions.append("c.organization = @organization")
-        parameters.append(dict(name="@organization", value=organization))
+        if organization.strip() in MAIN_ORGANIZATIONS:
+            conditions.append("c.organization = @organization")
+            parameters.append(dict(name="@organization", value=organization))
+        else:
+            title_file_search = await title_search_client.full_text_search(
+                keyword=organization.strip(),
+                select_fields=["title", "titleWithExtension"],
+                search_fields=["title", "titleWithExtension"],
+                top=10
+            )
+
+            list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
+            title_str = ",".join([f"'{t}'" for t in list_of_titles])
+            conditions.append(f"c.documentTitle IN ({title_str})")
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -309,7 +310,7 @@ def get_list_documents_by_expiration_year(
     return "\n".join(result_list)
 
 @tool
-def get_list_documents_already_expired(
+async def get_list_documents_already_expired(
                 organization: Optional[str] = None,
                 order_by: Optional[Literal['latest', 'earliest']] = 'latest'      
 ):
@@ -331,8 +332,20 @@ def get_list_documents_already_expired(
         """
     
     if organization:
-        conditions.append("c.organization = @organization")
-        parameters.append(dict(name="@organization", value=organization))
+        if organization.strip() in MAIN_ORGANIZATIONS:
+            conditions.append("c.organization = @organization")
+            parameters.append(dict(name="@organization", value=organization))
+        else:
+            title_file_search = await title_search_client.full_text_search(
+                keyword=organization.strip(),
+                select_fields=["title", "titleWithExtension"],
+                search_fields=["title", "titleWithExtension"],
+                top=10
+            )
+
+            list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
+            title_str = ",".join([f"'{t}'" for t in list_of_titles])
+            conditions.append(f"c.documentTitle IN ({title_str})")
 
     if conditions:
         query += " AND " + " AND ".join(conditions)
@@ -364,7 +377,7 @@ def get_list_documents_already_expired(
     return "\n".join(result_list)
 
 @tool
-def get_list_all_documents_by_organization(
+async def get_list_all_documents_by_organization(
                 organization: Optional[str] = None,
                 permit_type: Optional[Literal['PLO', 'KKPR/KKPRL', 'Ijin Lingkungan']]= None      
 ):
@@ -387,8 +400,20 @@ def get_list_all_documents_by_organization(
         """
     
     if organization:
-        conditions.append("c.organization = @organization")
-        parameters.append(dict(name="@organization", value=organization))
+        if organization.strip() in MAIN_ORGANIZATIONS:
+            conditions.append("c.organization = @organization")
+            parameters.append(dict(name="@organization", value=organization))
+        else:
+            title_file_search = await title_search_client.full_text_search(
+                keyword=organization.strip(),
+                select_fields=["title", "titleWithExtension"],
+                search_fields=["title", "titleWithExtension"],
+                top=10
+            )
+
+            list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
+            title_str = ",".join([f"'{t}'" for t in list_of_titles])
+            conditions.append(f"c.documentTitle IN ({title_str})")
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
