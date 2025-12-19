@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from abc import ABC, abstractmethod
+from typing import List, Literal, Optional
 from pydantic import (
     BaseModel,
     confloat,
@@ -16,7 +17,6 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_snake
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Literal, Optional
 from typing_extensions import Self
 from quart import Request
 from backend.utils import parse_multi_columns, generateFilterString
@@ -67,16 +67,29 @@ class _ChatHistorySettings(BaseSettings):
 
 class _PermitMetaDataSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="AZURE_COSMOSDB_",
+        env_prefix="AZURE_COSMOSDB_PERMIT_",
         env_file=DOTENV_PATH,
         extra="ignore",
         env_ignore_empty=True
     )
 
-    permit_database: str
     account: str
-    account_key: Optional[str] = None
-    permit_container: str
+    account_key: str
+    database: str
+    container: str
+
+class _EnableLangfuse(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="LANGFUSE_",
+        env_file=DOTENV_PATH,
+        extra="ignore",
+        env_ignore_empty=True
+    )
+
+    enable: bool = False
+    secret_key: Optional[str] = None
+    public_key: Optional[str] = None
+    base_url: Optional[str] = None
 
 class _PromptflowSettings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -112,7 +125,7 @@ class _AzureOpenAISettings(BaseSettings):
         extra='ignore',
         env_ignore_empty=True
     )
-    
+
     model: str
     key: Optional[str] = None
     resource: Optional[str] = None
@@ -366,6 +379,100 @@ class _AzureSearchSettings(BaseSettings, DatasourcePayloadConstructor):
             "parameters": parameters
         }
 
+class _AzureSearchSettingsV2(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AZURE_SEARCH_",
+        env_file=DOTENV_PATH,
+        extra="ignore",
+        env_ignore_empty=True
+    )
+    _type: Literal["azure_search"] = PrivateAttr(default="azure_search")
+    top_k: int = Field(default=5, serialization_alias="top_n_documents")
+    strictness: int = 3
+    enable_in_domain: bool = Field(default=True, serialization_alias="in_scope")
+    service: str = Field(exclude=True)
+    endpoint_suffix: str = Field(default="search.windows.net", exclude=True)
+    index: str = Field(serialization_alias="index_name")
+    title_index: str = Field("",description='title index if provided')
+    key: Optional[str] = Field(default=None, exclude=True)
+    api_version: Optional[str] = Field(default=None, exclude=True)
+    use_semantic_search: bool = Field(default=False, exclude=True)
+    semantic_search_config: str = Field(default="", serialization_alias="semantic_configuration")
+    scoring_profile_config: str = Field(default="", serialization_alias="scoring_profile")
+    content_columns: Optional[str] = Field(default=None, exclude=True)
+    vector_columns: Optional[str] = Field(default=None, exclude=True)
+    title_column: Optional[str] = Field(default=None, exclude=True)
+    url_column: Optional[str] = Field(default=None, exclude=True)
+    filename_column: Optional[str] = Field(default=None, exclude=True)
+    query_type: Literal[
+        'simple',
+        'vector',
+        'semantic',
+        'vector_simple_hybrid',
+        'vectorSimpleHybrid',
+        'vector_semantic_hybrid',
+        'vectorSemanticHybrid'
+    ] = "simple"
+    query_captions: Optional[str] = Field(default=None, exclude=True)
+    query_answers: Optional[str] = Field(default=None, exclude=True)
+    query_fields: Optional[str] = Field(default=None, exclude=True)
+    query_language: Optional[str] = Field(default=None, exclude=True)
+    query_rewrites: Optional[str] = Field(default=None, exclude=True)
+    vectorizable_text_query_kind: Optional[str] = Field(default=None, exclude=True)
+    vectorizable_text_query_fields: Optional[str] = Field(default=None, exclude=True)
+    select: Optional[str] = Field(default=None, exclude=True)
+    permitted_groups_column: Optional[str] = Field(default=None, exclude=True)
+
+    # Constructed fields
+    endpoint: Optional[str] = None
+    authentication: Optional[dict] = None
+    embedding_dependency: Optional[dict] = None
+    fields_mapping: Optional[dict] = None
+    filter: Optional[str] = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def set_endpoint(self) -> Self:
+        self.endpoint = f"https://{self.service}.{self.endpoint_suffix}"
+        return self
+
+    @model_validator(mode="after")
+    def set_authentication(self) -> Self:
+        if self.key:
+            self.authentication = {"type": "api_key", "key": self.key}
+        else:
+            self.authentication = {"type": "system_assigned_managed_identity"}
+
+        return self
+
+    @model_validator(mode="after")
+    def set_fields_mapping(self) -> Self:
+        self.fields_mapping = {
+            "content_fields": self.content_columns,
+            "title_field": self.title_column,
+            "url_field": self.url_column,
+            "filepath_field": self.filename_column,
+            "vector_fields": self.vector_columns
+        }
+        return self
+
+    @model_validator(mode="after")
+    def set_query_type(self) -> Self:
+        self.query_type = to_snake(self.query_type)
+
+    def _set_filter_string(self, request: Request) -> str:
+        if self.permitted_groups_column:
+            user_token = request.headers.get("X-MS-TOKEN-AAD-ACCESS-TOKEN", "")
+            logging.debug(f"USER TOKEN is {'present' if user_token else 'not present'}")
+            if not user_token:
+                raise ValueError(
+                    "Document-level access control is enabled, but user access token could not be fetched."
+                )
+
+            filter_string = generateFilterString(user_token)
+            logging.debug(f"FILTER: {filter_string}")
+            return filter_string
+
+        return None
 
 class _AzureCosmosDbMongoVcoreSettings(
     BaseSettings,
@@ -778,14 +885,16 @@ class _BaseSettings(BaseSettings):
 class _AppSettings(BaseModel):
     base_settings: _BaseSettings = _BaseSettings()
     azure_openai: _AzureOpenAISettings = _AzureOpenAISettings()
+    azure_aisearch: _AzureSearchSettingsV2 = _AzureSearchSettingsV2()
     search: _SearchCommonSettings = _SearchCommonSettings()
     ui: Optional[_UiSettings] = _UiSettings()
-    
+
     # Constructed properties
     chat_history: Optional[_ChatHistorySettings] = None
-    permit_metadata: Optional[_PermitMetaDataSettings] = None
+    permit_metadata: _PermitMetaDataSettings = _PermitMetaDataSettings()
     datasource: Optional[DatasourcePayloadConstructor] = None
     promptflow: Optional[_PromptflowSettings] = None
+    langfuse: _EnableLangfuse = _EnableLangfuse()
 
     @model_validator(mode="after")
     def set_promptflow_settings(self) -> Self:

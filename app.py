@@ -5,6 +5,8 @@ import logging
 import uuid
 import httpx
 import asyncio
+import time
+
 from quart import (
     Blueprint,
     Quart,
@@ -23,7 +25,8 @@ from azure.identity.aio import (
 )
 from backend.auth.auth_utils import get_authenticated_user_details
 from backend.security.ms_defender_utils import get_msdefender_user_json
-from backend.history.cosmosdbservice import CosmosConversationClient, CosmosPermitMetaData
+from backend.history.cosmosdbservice import CosmosConversationClient
+from backend.metadata.cosmos_db_service import CosmosPermitMetaData, cosmos_client
 from backend.settings import (
     app_settings,
     MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION
@@ -34,7 +37,14 @@ from backend.utils import (
     format_non_streaming_response,
     convert_to_pf_format,
     format_pf_non_streaming_response,
+    clean_messages,
+    format_non_streaming_responseV2
 )
+
+from backend.agent.agent_langchain import agent
+
+from langfuse import Langfuse
+from langfuse.langchain import CallbackHandler
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -50,9 +60,33 @@ def create_app():
     async def init():
         try:
             app.cosmos_conversation_client = await init_cosmosdb_client()
-            app.cosmos_permitmetadata_client = await init_permit_cosmosdb_client()
 
+            # ensure cosmos permit metadata ready
+            ready, message = await cosmos_client.ensure()
+            if not ready:
+                logging.error(message)
+                raise Exception(message)
+
+            # check if in dev mode want to trace in langfuse
+            if app_settings.langfuse.enable:
+                global LF
+                global CB
+
+                LF = Langfuse(
+                    public_key=app_settings.langfuse.public_key,
+                    secret_key=app_settings.langfuse.secret_key,
+                    host=app_settings.langfuse.base_url
+                )
+
+                # Verify connection
+                if LF.auth_check():
+                    logging.info("Langfuse client is authenticated and ready!")
+                else:
+                    logging.info("Authentication failed. Please check your credentials and host.")
+
+            CB  = CallbackHandler()
             cosmos_db_ready.set()
+
         except Exception as e:
             logging.exception("Failed to initialize CosmosDB client")
             app.cosmos_conversation_client = None
@@ -500,6 +534,83 @@ async def complete_chat_request(request_body, request_headers):
 
     return non_streaming_response
 
+async def complete_chat_requestV2(request_body, request_headers):
+    if app_settings.base_settings.use_promptflow:
+        response = await promptflow_request(request_body)
+        history_metadata = request_body.get("history_metadata", {})
+        return format_pf_non_streaming_response(
+            response,
+            history_metadata,
+            app_settings.promptflow.response_field_name,
+            app_settings.promptflow.citations_field_name
+        )
+    else:
+        try:
+            # get request message
+            messages = clean_messages(request_body.get("messages", []))
+            history_metadata = request_body.get("history_metadata", {})
+
+            # invoke Agent
+            if app_settings.langfuse.enable:
+                response = ''
+                with LF.start_as_current_observation(
+                    as_type="span",
+                    name="process-request",
+                    input = messages[-1]['content']
+                ) as span:
+                    with LF.start_as_current_observation(
+                        as_type="generation",
+                        name="answer-generation",
+                        model="gpt-40",
+                    ) as generation:
+                        agent_response = await agent.ainvoke(
+                            {"messages": messages},
+                            config={"recursion_limit": 10, "callbacks": [CB]}
+                        ) #type: ignore
+
+                        if agent_response['messages'][-1].content:
+                            response = agent_response['messages'][-1].content
+                            generation.update(output=response)
+
+                span.update(output= response)
+                LF.flush()
+
+            else:
+                agent_response = await agent.ainvoke(
+                    {"messages": messages},
+                    config={"recursion_limit": 10}
+                )
+
+            non_streaming_response = format_non_streaming_responseV2(
+                agent_response['messages'][-1],
+                history_metadata,
+                'agent-generated'
+             )
+
+            return non_streaming_response
+
+        except Exception as e:
+            logging.exception("Error in complete_chat_request with LangChain Agent")
+            # Return a valid error structure so the frontend handles it gracefully
+            return {
+                "id": str(uuid.uuid4()),
+                "model": "error-handler",
+                "created": int(time.time()),
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "messages": [  # Changed from 'message' to 'messages' (array)
+                            {
+                                "role": "assistant",
+                                "content": f"An internal error occurred: {str(e)}"
+                            }
+                        ]
+                    }
+                ]
+            }
+
 class AzureOpenaiFunctionCallStreamState():
     def __init__(self):
         self.tool_calls = []                # All tool calls detected in the stream
@@ -604,7 +715,8 @@ async def conversation_internal(request_body, request_headers):
             response.mimetype = "application/json-lines"
             return response
         else:
-            result = await complete_chat_request(request_body, request_headers)
+            # result = await complete_chat_request(request_body, request_headers)
+            result = await complete_chat_requestV2(request_body, request_headers)
             return jsonify(result)
 
     except Exception as ex:

@@ -3,6 +3,7 @@ import json
 import logging
 import requests
 import dataclasses
+import time
 
 from typing import List
 
@@ -103,6 +104,37 @@ def format_non_streaming_response(chatCompletion, history_metadata, apim_request
                 }
             )
             return response_obj
+
+    return {}
+
+def format_non_streaming_responseV2(chatCompletion, history_metadata, apim_request_id):
+    if chatCompletion:
+        response_obj = {
+            "id": chatCompletion.id,
+            "model": chatCompletion.response_metadata['model_name'],
+            "created": int(time.time()),
+            "object": 'chat.completion',
+            "choices": [{"messages": []}],
+            "history_metadata": history_metadata,
+            "apim-request-id": apim_request_id,
+        }
+
+        if chatCompletion.type == 'tool':
+            response_obj["choices"][0]["messages"].append(
+                    {
+                        "role": "tool",
+                        "content": chatCompletion.content,
+                    }
+                )
+
+        response_obj["choices"][0]["messages"].append(
+            {
+                "role": "assistant",
+                "content": chatCompletion.content,
+            }
+        )
+
+        return response_obj
 
     return {}
 
@@ -230,3 +262,16 @@ def comma_separated_string_to_list(s: str) -> List[str]:
     '''
     return s.strip().replace(' ', '').split(',')
 
+
+def clean_messages(messages: List)-> List:
+    response: List = []
+
+    if len(messages) == 0:
+        return response
+
+    for message in messages:
+        if message == {} or message.get('content') == '':
+            continue
+        response.append(message)
+
+    return response
