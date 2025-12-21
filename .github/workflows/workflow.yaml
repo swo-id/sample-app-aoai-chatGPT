@@ -22,6 +22,10 @@ env:
 jobs:
  build-and-deploy:
   runs-on: ubuntu-latest
+  permissions:
+    id-token: write
+    contents: read
+
   # environment: dev
   steps:
   # checkout the repo 
@@ -41,11 +45,12 @@ jobs:
      pip install setuptools
      pip install -r requirements.txt
   # Azure login
-  - uses: azure/login@v1
+  - name: Log in to Azure via Azure CLI
+    uses: azure/login@v1
     with:
         client-id: ${{ vars.AZURE_CLIENT_ID }} # Required to log in with OIDC
         tenant-id: ${{ vars.AZURE_TENANT_ID }} # Required to log in with OIDC
-        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} #
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} # Required to log in with OIDC
 
   - uses: azure/appservice-settings@v1
     with:
