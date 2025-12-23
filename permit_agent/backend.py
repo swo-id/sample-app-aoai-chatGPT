@@ -1,4 +1,6 @@
 import aiohttp
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from typing import List, Dict, Any
 
 class AzureAISearch:
@@ -26,13 +28,23 @@ class AzureAISearch:
             "Content-Type": "application/json",
             "api-key": f"{api_key}"
         }
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, ConnectionError))
+    )
     async def _make_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Helper method to make asynchronous POST requests."""
         url: str = f"{self.base_url}/indexes/{self.index_name}/docs/search?api-version={self.api_version}"
         
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=self.headers, json=payload) as response:
-                response.raise_for_status()
+                if response.status != 200:
+                    error_text = await response.text()
+                    if response.status in [429, 500, 502, 503, 504]:
+                        raise TimeoutError(f"Azure AI Search transient error {response.status}: {error_text}")
+                    raise Exception(f"Azure AI Search Error {response.status}: {error_text}")
                 return await response.json()
     
     async def full_text_search(self, keyword: str, top: int = 5, select_fields: List[str] = None, search_fields: List[str] = None) -> Dict[str, Any]:
@@ -54,6 +66,7 @@ class AzureAISearch:
 
         payload: Dict[str, Any] = {
             "search": keyword,
+            "queryType": "full",
             "count": True,
             "top": top,
             "select": ", ".join(select_fields),
@@ -133,7 +146,9 @@ class AzureAISearch:
                                       self,
                                       keyword: str,
                                       k: int = 5,
-                                      select_fields: List[str] = None
+                                      select_fields: List[str] = None,
+                                      scoring_profile: str = "content-scoring",
+                                      semantic_configuration: str = "content-score"
     ) -> Dict[str, Any]:
         """
         Perform a semantic ranking search using keyword search.
@@ -164,9 +179,9 @@ class AzureAISearch:
                     "queryType": "semantic",
                     "captions": "extractive",
                     "answers": "extractive|count-3",
-                    "semanticConfiguration": "content-score",
+                    "semanticConfiguration": str(semantic_configuration),
                     "searchFields": "content, title",
-                    "scoringProfile": "content-scoring",
+                    "scoringProfile": str(scoring_profile),
                     "queryLanguage": "id-id",
                     "select": ", ".join(select_fields),
                     "queryRewrites": "generative",
