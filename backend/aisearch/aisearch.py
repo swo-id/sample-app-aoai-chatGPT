@@ -33,9 +33,10 @@ class AzureAISearch:
             "Content-Type": "application/json",
             "api-key": f"{api_key}"
         }
+
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, ConnectionError))
     )
     async def _make_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,6 +77,7 @@ class AzureAISearch:
 
         payload: Dict[str, Any] = {
             "search": keyword,
+            "queryType": "full",
             "count": True,
             "top": top,
             "select": ", ".join(select_fields),
