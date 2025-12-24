@@ -214,5 +214,5 @@ retrieval_client = AzureAISearch(
 title_search_client = AzureAISearch(
     base_url=app_settings.azure_aisearch.endpoint or "",
     api_key=app_settings.azure_aisearch.key or "",
-    index_name= app_settings.azure_aisearch.index
+    index_name= app_settings.azure_aisearch.title_index
 )
