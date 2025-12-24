@@ -552,27 +552,12 @@ async def complete_chat_requestV2(request_body, request_headers):
 
             # invoke Agent
             if app_settings.langfuse.enable:
-                response = ''
-                with LF.start_as_current_observation(
-                    as_type="span",
-                    name="process-request",
-                    input = messages[-1]['content']
-                ) as span:
-                    with LF.start_as_current_observation(
-                        as_type="generation",
-                        name="answer-generation",
-                        model="gpt-40",
-                    ) as generation:
-                        agent_response = await agent.ainvoke(
-                            {"messages": messages},
-                            config={"recursion_limit": 10, "callbacks": [CB]}
-                        ) #type: ignore
 
-                        if agent_response['messages'][-1].content:
-                            response = agent_response['messages'][-1].content
-                            generation.update(output=response)
+                agent_response = await agent.ainvoke(
+                    {"messages": messages},
+                    config={"recursion_limit": 10, "callbacks": [CB]}
+                )
 
-                span.update(output= response)
                 LF.flush()
 
             else:
