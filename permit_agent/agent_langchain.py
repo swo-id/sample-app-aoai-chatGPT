@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 from azure.cosmos import CosmosClient
 
-load_dotenv(".env", override=True)
+load_dotenv(".env.pertamina", override=True)
 print(f"Loaded environment: {os.getenv('ENV_NAME')}")
 
 cosmos_client = CosmosClient(
@@ -84,32 +84,80 @@ class AgentResponse(BaseModel):
     answer: str = Field(..., description="The answer to the user's question.")
     document: str = Field(..., description="The document citations used to answer the question.")
 
-async def get_permit_document_content(keyword: str):
+@tool
+async def get_permit_document_content(keyword: str, organization: str = None) -> str:
     """
+    CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information. 
+
     Get relevant permit documents content relevant from Azure AI Search based on keyword.
     This used if the question requires to lookup into the documents and get relevant information.
 
 
     Args:
         keyword (str): The keyword to search for relevant documents or filename from previous file list search.
+        organization (str): Organization or location for documents filter by.
     Returns:
         str: The relevant documents concatenated as a single string.
+
+    Example use cases:
+    - Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?" : {"keyword": "kedalaman KKPRL IT Jakarta", "organization": "Integrated Terminal Jakarta"}
+    - Sebutkan dampak dan sumber dampak pada tahap kontruksi yang ada di matriks rencana pengelolaan lingkungan hidup pada persetujuan lingkungan RU 6 Balongan ! : {"keyword": "dampak sumber dampak tahap konstruksi matriks rencana pengelolaan lingkungan hidup persetujuan lingkungan RU 6 Balongan", "organization": "RU VI Balongan"}
+    - Apa saja instalasi yang dihubungkan oleh pipa penyalur CY1 dan CY 2 ? : {"keyword" : "pipa penyalur CY1 dan CY2", organization": "CY1, CY2"}
+    - Berapa luasan yang dimohon dan disetujui untuk IT Cilacap berdasarkan dokumen KKPR nya ? : {"keyword": "KKPR IT Cilacap", "organization": "Integrated Terminal Cilacap"}
+    - Sebutkan instalasi mana saja yang dilalui oleh pipa penyalur Cilacap - Bandung ! : {"keyword" : "pipa penyalur Cilacap - Bandung", "organization": "Cilacap Bandung"}
+    - Apa saja instalasi yang teramasuk instalasi STRANAS menurut dokumen KKPR nya ? : {"keyword" : "instalasi STRANAS KKPR", "organization": "STRANAS"}
     """
 
-    # embeddings = client.embeddings.create(
-    #     input=keyword,
-    #     model=EMBEDDINGS_MODEL
-    # )
+    conditions = []
+    parameters = []
+    filenames = None
 
-    # vector = embeddings.data[0].embedding
+    query = """
+            SELECT c.documentTitle, c.permitType, c.organization, c.filepath, p.issueDate
+            FROM c
+            JOIN p IN c.permits
+            WHERE p.issueDate != ""
+        """
+    if organization:
+        if organization.strip() in MAIN_ORGANIZATIONS:
+            conditions.append("c.organization = @organization")
+            parameters.append(dict(name="@organization", value=organization))
+        else:
+            conditions.append("RegexMatch(c.filepath, @organization, 'i')")
+            parameters.append(dict(name="@organization", value=organization))
+
+        query_with_condition = query + " AND " + " AND ".join(conditions)
+
+        results = container.query_items(
+            query=query_with_condition,
+            parameters=parameters,
+            enable_cross_partition_query=True
+            )
+
+        items = [item for item in results]
+
+        filenames = [item['filepath'] for item in items]
+
+        if not items:
+            # Fallback to title search if no items found
+            conditions = conditions[:-1]  # Remove last organization condition
+            title_file_search = await title_search_client.full_text_search(
+                keyword=organization.strip(),
+                select_fields=["title", "titleWithExtension"],
+                search_fields=["title"],
+                top=15
+            )
+
+            filenames = [doc['title'] for doc in title_file_search['value']]
 
     ## Change retrieval method and configuration as needed
-    search_results = await retrieval_client.semantic_ranking_search(
+    search_results = await retrieval_client.semantic_ranking_search_with_filter(
         keyword=keyword,
         k=10, # number of top documents to retrieve
         select_fields=["title", "content"],
         scoring_profile=AZURE_AI_SEARCH_SCORING_PROFILE,
-        semantic_configuration=AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION
+        semantic_configuration=AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION,
+        filenames=filenames
         # vector_fields=["contentVector"]
     )
 
@@ -198,7 +246,7 @@ async def get_list_document_by_expiration_interval(
     result_list = []
     for item in items:
         result_list.append(
-            f"- {item['documentTitle']} - {item['permitNumber']} "
+            f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
             f"\n  (Org: {item['organization']}, Expires: {item['expirationDate']})"
             f"\n  Document path: {item.get('filepath', 'N/A')} "
             f"\n  Summary: {item['permitSummary']}"
@@ -210,6 +258,7 @@ async def get_list_document_by_expiration_interval(
 async def get_list_documents_by_issue_year(
                 permit_type: Literal['PLO', 'KKPR', 'KKPRL', 'Ijin Lingkungan'] = None,
                 year: int = None,
+                month: int = None,
                 organization: Optional[str] = None, 
                 operator: Literal['equal', 'greater', 'less'] = None,
                 order_by: Optional[Literal['latest', 'earliest']] = 'latest'):
@@ -217,14 +266,24 @@ async def get_list_documents_by_issue_year(
     Get list of documents that issued in based on year and optionally filtered by permit type and organization.
 
     Args:
-        target_year (int): Target document issued year.
+        year (int): Target document issued year.
+        month (int, optional): Target document issued month.
         document_type (str, optional): Type of document to filter by PLO, KKPR, KKPRL, Ijin Lingkungan.
         operator (str, optional): Comparison operator ('equal', 'greater', 'less').
+        order_by (str, optional): Order by 'latest' or 'earliest'.
+        organization (str, optional): Organization to filter by.
 
     Example use cases:
       - Sebutkan PLO (CA TAHUN 2020) PMO PGN beserta Lokasinya : {"organization" : "PGN CA tahun 2020", "permit_type": "PLO", "year": 2020}
       - Sebutkan RU yang dokumen KKPRLnya di terbitkan pada tahun 2023! : {"organization" : "RU", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
       - Sebutkan Instalasi milik PGN yang memiliki KKPR dengan tanggal terbit paling lama ! : {"organization" : "PGN", "permit_type" : "KKPR", "order_by" : "earliest"}
+      - Apa saja Instalasi DPPU yang dokumen KKPR nya di terbitkan pada tahun 2023 ? : {"organization" : "DPPU", "permit_type" : "KKPR", "operator" : "equal", "year" : 2023}
+      - Sebutkan KKPR mana saja yang di terbitkan pada tahun 2024 pada cluster non PMO ! : {"organization" : "Non Cluster PMO", "permit_type" : "KKPR", "operator" : "equal", "year" : 2024}
+      - Sebutkan nomor KKPRL milik SH PGN yang di terbitkan pada tahun 2023 ! : {"organization" : "PGN", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
+      - Sebutkan instalasi milik SHU yang Persetujuan Lingkungannya diperbaharui paling baru ! : {'organization': 'SHU', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+      - Sebutkan Persetujuan Lingkungan milik SH PGN yang terakhir kali di perbaharui ! : {'organization': 'PGN', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+      - Kapan terakhir persetujuan lingkungan di EP Asset 1- Field Jambi diperbaharui ? : {'organization': 'Field Jambi', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+      - Kapan saja dokumen UKL UPL di FT Bandung Group - Padalarang di perbaharui ? : {'organization': 'FT Bandung - Padalarang', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
     """
     
     query = """
@@ -232,6 +291,7 @@ async def get_list_documents_by_issue_year(
                p.issueDate, p.permitSummary, p.permitNumber
         FROM c
         JOIN p IN c.permits
+        WHERE p.issueDate != ""
     """
 
     conditions = []
@@ -255,15 +315,35 @@ async def get_list_documents_by_issue_year(
         else:  # equal
             conditions.append("YEAR(p.issueDate) = @year")
         
+    if year and month:
+        parameters.append(dict(name="@month", value=month))
+        conditions.append("MONTH(p.issueDate) = @month")
+        
     if organization:
         if organization.strip() in MAIN_ORGANIZATIONS:
             conditions.append("c.organization = @organization")
             parameters.append(dict(name="@organization", value=organization))
         else:
+            conditions.append("RegexMatch(c.filepath, @organization, 'i')")
+            parameters.append(dict(name="@organization", value=organization))
+
+        query_with_condition = query + " AND " + " AND ".join(conditions)
+
+        results = container.query_items(
+            query=query_with_condition,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        )
+
+        items = [item for item in results]
+
+        if not items:
+            # Fallback to title search if no items found
+            conditions = conditions[:-1]  # Remove last organization condition
             title_file_search = await title_search_client.full_text_search(
                 keyword=organization.strip(),
                 select_fields=["title", "titleWithExtension"],
-                search_fields=["title", "titleWithExtension"],
+                search_fields=["title"],
                 top=10
             )
 
@@ -271,30 +351,31 @@ async def get_list_documents_by_issue_year(
             title_str = ",".join([f"'{t}'" for t in list_of_titles])
             conditions.append(f"c.documentTitle IN ({title_str})")
 
+            query += " AND " + " AND ".join(conditions)
 
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+            results = container.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            )
 
-    results = container.query_items(
-        query=query,
-        parameters=parameters,
-        enable_cross_partition_query=True
-    )
+            items = [item for item in results]
 
-    items = [item for item in results]
+            if not items:
+                return "No documents found issued in this year."
 
-    if not items:
-        return "No documents found issued in this year."
-
+    doc_len = 20
     if order_by == 'latest':
         items.sort(key=lambda x: x.get('issueDate', ''), reverse=True)
     else:  # earliest
         items.sort(key=lambda x: x.get('issueDate', ''))
+    
+    filtered_items = items[:doc_len]
 
-    result_list = [f"List of documents issued is {len(items)} items:"]
-    for item in items:
+    result_list = [f"List of documents issued is {len(filtered_items)} items:"]
+    for item in filtered_items:
         result_list.append(
-            f"- {item['documentTitle']} - {item['permitNumber']} "
+            f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
             f"\n  (Org: {item['organization']}, Issue Date: {item['issueDate']})"
             f"\n  Document path: {item.get('filepath', 'N/A')} "
             f"\n  Summary: {item['permitSummary']}"
@@ -321,7 +402,6 @@ async def get_list_documents_by_expiration_year(
 
     Example use cases:
       - Sebutkan area pada PGN SOR 1 yang paling cepat akan kadaluwarsa dan kapan kadaluwarsanya?: {"organization": "PGN SOR 1", "order_by": "earliest", "operator": "greater"}
-
     """
     
     query = """
@@ -389,7 +469,7 @@ async def get_list_documents_by_expiration_year(
     result_list = []
     for item in items:
         result_list.append(
-            f"- {item['documentTitle']} - {item['permitNumber']} "
+            f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
             f"\n  (Org: {item['organization']}, Expires: {item['expirationDate']})"
             f"\n  Document path: {item.get('filepath', 'N/A')} "
             f"\n  Summary: {item['permitSummary']}"
@@ -403,7 +483,7 @@ async def get_list_documents_already_expired(
                 order_by: Optional[Literal['latest', 'earliest']] = 'latest'      
 ):
     """
-    Get list of documents that have already expired.
+    Get list of documents that have already expired. This is only for PLO document types.
 
     Args:
         organization (str, optional): Organization to filter by.
@@ -492,7 +572,7 @@ async def get_list_all_documents_by_organization(
     Example use cases:
       - Berapa jumlah dokumen PLO yang dimiliki oleh RU II: {"organization": "RU II", "permit_type": "PLO", "keyword": "PLO RU II"}
       - Sebutkan nomor SK Perstujuan Lingkungan yang ada di SOR 2 ! : {"organization": "SOR 2", "permit_type": "Ijin Lingkungan", "keyword": "SK Persetujuan Ijin Lingkungan SOR 2"}
-      - Sebutkkan nomor KKPR yang dimiliki oleh IT Balongan ! : {"organization" : "IT Balongan", "permit_type": "KKPR", "keyword": "KKPR IT Balongan"}
+      - Sebutkkan nomor KKPR yang dimiliki oleh IT Balongan ! : {"organization" : "Balongan", "permit_type": "KKPR", "keyword": "KKPR IT Balongan"}
     """
 
     conditions = []
@@ -517,13 +597,16 @@ async def get_list_all_documents_by_organization(
             title_file_search = await title_search_client.full_text_search(
                 keyword=organization.strip(),
                 select_fields=["title", "titleWithExtension"],
-                search_fields=["title", "titleWithExtension"],
-                top=10
+                search_fields=["title"],
+                top=100
             )
 
             list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
             title_str = ",".join([f"'{t}'" for t in list_of_titles])
             conditions.append(f"c.documentTitle IN ({title_str})")
+            
+            # conditions.append("RegexMatch(c.filepath, @organization, 'i')")
+            # parameters.append(dict(name="@organization", value=organization))
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -536,51 +619,53 @@ async def get_list_all_documents_by_organization(
 
     items = [item for item in results]
 
-    search_results = await retrieval_client.semantic_ranking_search(
-        keyword=keyword,
-        k=10, # number of top documents to retrieve
-        select_fields=["title", "content"],
-        scoring_profile=AZURE_AI_SEARCH_SCORING_PROFILE,
-        semantic_configuration=AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION
-        # vector_fields=["contentVector"]
-    )
-
-    docs = [doc['content'] for doc in search_results['value']]
-    title = [doc['title'] for doc in search_results['value']]
+    doc_len = 30
 
     if not items:
-        return "No documents found for the specified organization."
+        result_list =  ["No documents found for the specified organization."]
+    else:
+        filtered_items = items[:doc_len]
+        result_list = [f"List of documents for organization {organization} items:"]
+        if permit_type == 'PLO': # PLO has expiration date
+            for item in filtered_items:
+                result_list.append(
+                    f"- {item['documentTitle']} "
+                    f"\n  - Permit Number: {item['permitNumber']} "
+                    f"\n  - (Org: {item['organization']}, Issue Date: {item['issueDate']}, Expiration Date: {item['expirationDate']})"
+                    f"\n  - Document path: {item.get('filepath', 'N/A')} "
+                    f"\n  - Summary: {item['permitSummary']}"
+                )
+        else:
+            for item in filtered_items:
+                result_list.append(
+                    f"- {item['documentTitle']} "
+                    f"\n  - Permit Number: {item['permitNumber']} "
+                    f"\n  - (Org: {item['organization']}, Issue Date: {item['issueDate']})"
+                    f"\n  - Document path: {item.get('filepath', 'N/A')} "
+                    f"\n  - Summary: {item['permitSummary']}"
+                )
 
-    result_list = [f"List of documents for organization {organization} is {len(items)} items:"]
-    for item in items:
-        result_list.append(
-            f"- {item['documentTitle']} - {item['permitNumber']} "
-            f"\n  (Org: {item['organization']}, Issue Date: {item['issueDate']}, Expiration Date: {item['expirationDate']})"
-            f"\n  Document path: {item.get('filepath', 'N/A')} "
-            f"\nSummary: {item['permitSummary']}"
-        )
-
-    vector_result = "\n".join([f"{t}: {d}" for t, d in zip(title, docs)])
     cosmos_result = "\n".join(result_list)
 
-    final_result = f"Content Search Results:\n{vector_result}\n\nMetadata DB Results:\n{cosmos_result}"
+    final_result = f"========Metadata DB Results========:\n\n{cosmos_result}"
 
     return final_result
 
 
 tools = [
-    Tool(
-        name="get_permit_document_content",
-        description="""CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information. 
-        Input: A search query or relevant keywords from the question
-        Returns: Top 10 relevant permit documents with titles and content that match the query
-        Example use cases: 
-        - "Berapa saja panjang submarine pipeline yang ada di IT semarang ?"
-        - "Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?"
-        DO NOT try to answer questions about specific permits without calling this tool first.""",
-        func=get_permit_document_content,
-        coroutine=get_permit_document_content
-        ), 
+    # Tool(
+    #     name="get_permit_document_content",
+    #     description="""CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information. 
+    #     Input: A search query or relevant keywords from the question
+    #     Returns: Top 10 relevant permit documents with titles and content that match the query
+    #     Example use cases: 
+    #     - "Berapa saja panjang submarine pipeline yang ada di IT semarang ?"
+    #     - "Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?"
+    #     DO NOT try to answer questions about specific permits without calling this tool first.""",
+    #     func=get_permit_document_content,
+    #     coroutine=get_permit_document_content
+    #     ), 
+    get_permit_document_content,
     get_current_year,
     get_current_year_month, 
     get_list_documents_by_issue_year,

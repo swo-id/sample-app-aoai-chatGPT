@@ -189,3 +189,58 @@ class AzureAISearch:
                     }
 
         return await self._make_request(payload)
+
+    async def semantic_ranking_search_with_filter(
+                                      self,
+                                      keyword: str,
+                                      k: int = 5,
+                                      select_fields: List[str] = None,
+                                      scoring_profile: str = "content-scoring",
+                                      filenames: List[str] = None,
+                                      semantic_configuration: str = "content-score"
+    ) -> Dict[str, Any]:
+        """
+        Perform a semantic ranking search using keyword search.
+        
+        Args:
+            keyword (str): The keyword to search with.
+            k (int): Number of nearest neighbors to retrieve. Defaults to 5.
+            select_fields : Fields to select in the response.
+        """
+
+        if select_fields is None:
+            raise ValueError("select_fields must be provided")
+
+        if filenames:
+            filter_str = f"search.in(title, '{','.join(filenames)}', ',')"
+        else:
+            filter_str = ""
+        
+        payload: Dict[str, Any] = {
+            "count": True,
+            "vectorQueries": [
+                {
+                    "kind": "text",
+                    "text": keyword,
+                    "fields": "titleVector,contentVector",
+                    "queryRewrites": "generative",
+                    "exhaustive": True,
+                    "weight": 10,
+                    "k": 5
+                    }
+                    ],
+                    "search": keyword,
+                    "queryType": "semantic",
+                    "captions": "extractive",
+                    "answers": "extractive|count-3",
+                    "semanticConfiguration": str(semantic_configuration),
+                    "searchFields": "content, title",
+                    "scoringProfile": str(scoring_profile),
+                    "queryLanguage": "id-id",
+                    "select": ", ".join(select_fields),
+                    "filter": filter_str,
+                    "queryRewrites": "generative",
+                    "debug": "queryRewrites"
+                    }
+
+        return await self._make_request(payload)
