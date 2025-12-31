@@ -9,7 +9,7 @@ from pydantic import SecretStr
 
 from backend.agent.config import AgentConfiguration
 from backend.settings import app_settings
-from backend.aisearch.aisearch import retrieval_client
+from backend.aisearch.aisearch import retrieval_client, title_search_client
 from backend.metadata.cosmos_db_service import cosmos_client
 
 
@@ -27,24 +27,37 @@ llm = AzureChatOpenAI(
     api_key=SecretStr(app_settings.azure_openai.key) if app_settings.azure_openai.key else None
 )
 
-async def get_permit_document_content(keyword: str) -> str:
+@tool
+async def get_permit_document_content(keyword: str, organization: Optional[str] = None) -> str:
     """
+    CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information. 
+
     Get relevant permit documents content relevant from Azure AI Search based on keyword.
     This used if the question requires to lookup into the documents and get relevant information.
 
-
     Args:
         keyword (str): The keyword to search for relevant documents or filename from previous file list search.
+        organization (str): Organization or location for documents filter by.
     Returns:
         str: The relevant documents concatenated as a single string.
+
+    Example use cases:
+    - Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?" : {"keyword": "kedalaman KKPRL IT Jakarta", "organization": "Integrated Terminal Jakarta"}
+    - Sebutkan dampak dan sumber dampak pada tahap kontruksi yang ada di matriks rencana pengelolaan lingkungan hidup pada persetujuan lingkungan RU 6 Balongan ! : {"keyword": "dampak sumber dampak tahap konstruksi matriks rencana pengelolaan lingkungan hidup persetujuan lingkungan RU 6 Balongan", "organization": "RU VI Balongan"}
+    - Apa saja instalasi yang dihubungkan oleh pipa penyalur CY1 dan CY 2 ? : {"keyword" : "pipa penyalur CY1 dan CY2", organization": "CY1, CY2"}
+    - Berapa luasan yang dimohon dan disetujui untuk IT Cilacap berdasarkan dokumen KKPR nya ? : {"keyword": "KKPR IT Cilacap", "organization": "Integrated Terminal Cilacap"}
+    - Sebutkan instalasi mana saja yang dilalui oleh pipa penyalur Cilacap - Bandung ! : {"keyword" : "pipa penyalur Cilacap - Bandung", "organization": "Cilacap Bandung"}
+    - Apa saja instalasi yang teramasuk instalasi STRANAS menurut dokumen KKPR nya ? : {"keyword" : "instalasi STRANAS KKPR", "organization": "STRANAS"}
     """
 
+    filenames = await cosmos_client.get_non_empty_issue_date_document(organization=organization)
+
     ## Change retrieval method and configuration as needed
-    search_results = await retrieval_client.semantic_ranking_search(
+    search_results = await retrieval_client.semantic_ranking_search_with_filter(
         keyword=keyword,
         k=10, # number of top documents to retrieve
-        select_fields=["title", "content"]
-        # vector_fields=["contentVector"]
+        select_fields = ["title", "content"],
+        filenames = filenames
     )
 
     docs = [doc['content'] for doc in search_results['value']]
@@ -92,25 +105,37 @@ async def get_list_document_by_expiration_interval(
 async def get_list_documents_by_issue_year(
                 permit_type: Literal['PLO', 'KKPR', 'KKPRL', 'Ijin Lingkungan'] = None, #type: ignore
                 year: int = None, #type: ignore
+                month: int = None, #type: ignore
                 organization: Optional[str] = None,
                 operator: Literal['equal', 'greater', 'less'] = None, #type: ignore
                 order_by: Optional[Literal['latest', 'earliest']] = 'latest'):
     """
     Get list of documents that issued in based on year and optionally filtered by permit type and organization.
-    
+
     Args:
-        target_year (int): Target document issued year.
+        year (int): Target document issued year.
+        month (int, optional): Target document issued month.
         document_type (str, optional): Type of document to filter by PLO, KKPR, KKPRL, Ijin Lingkungan.
         operator (str, optional): Comparison operator ('equal', 'greater', 'less').
-        
+        order_by (str, optional): Order by 'latest' or 'earliest'.
+        organization (str, optional): Organization to filter by.
+
     Example use cases:
-        - Sebutkan PLO (CA TAHUN 2020) PMO PGN beserta Lokasinya : {"organization" : "PGN CA tahun 2020", "permit_type": "PLO", "year": 2020}
-        - Sebutkan RU yang dokumen KKPRLnya di terbitkan pada tahun 2023! : {"organization" : "RU", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
-        - Sebutkan Instalasi milik PGN yang memiliki KKPR dengan tanggal terbit paling lama ! : {"organization" : "PGN", "permit_type" : "KKPR", "order_by" : "earliest"}
+      - Sebutkan PLO (CA TAHUN 2020) PMO PGN beserta Lokasinya : {"organization" : "PGN CA tahun 2020", "permit_type": "PLO", "year": 2020}
+      - Sebutkan RU yang dokumen KKPRLnya di terbitkan pada tahun 2023! : {"organization" : "RU", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
+      - Sebutkan Instalasi milik PGN yang memiliki KKPR dengan tanggal terbit paling lama ! : {"organization" : "PGN", "permit_type" : "KKPR", "order_by" : "earliest"}
+      - Apa saja Instalasi DPPU yang dokumen KKPR nya di terbitkan pada tahun 2023 ? : {"organization" : "DPPU", "permit_type" : "KKPR", "operator" : "equal", "year" : 2023}
+      - Sebutkan KKPR mana saja yang di terbitkan pada tahun 2024 pada cluster non PMO ! : {"organization" : "Non Cluster PMO", "permit_type" : "KKPR", "operator" : "equal", "year" : 2024}
+      - Sebutkan nomor KKPRL milik SH PGN yang di terbitkan pada tahun 2023 ! : {"organization" : "PGN", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
+      - Sebutkan instalasi milik SHU yang Persetujuan Lingkungannya diperbaharui paling baru ! : {'organization': 'SHU', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+      - Sebutkan Persetujuan Lingkungan milik SH PGN yang terakhir kali di perbaharui ! : {'organization': 'PGN', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+      - Kapan terakhir persetujuan lingkungan di EP Asset 1- Field Jambi diperbaharui ? : {'organization': 'Field Jambi', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+      - Kapan saja dokumen UKL UPL di FT Bandung Group - Padalarang di perbaharui ? : {'organization': 'FT Bandung - Padalarang', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
     """
     return await cosmos_client.get_list_documents_by_issue_year(
         permit_type=permit_type,
         year=year,
+        month=month,
         organization=organization,
         operator=operator,
         order_by=order_by
@@ -152,7 +177,7 @@ async def get_list_documents_already_expired(
                 order_by: Optional[Literal['latest', 'earliest']] = 'latest'
 ):
     """
-    Get list of documents that have already expired.
+    Get list of documents that have already expired. This is only for PLO document types.
 
     Args:
         organization (str, optional): Organization to filter by.
@@ -195,18 +220,19 @@ async def get_list_all_documents_by_organization(
         )
 
 tools = [
-    Tool(
-        name="get_permit_document_content",
-        description="""CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information.
-        Input: A search query or relevant keywords from the question
-        Returns: Top 10 relevant permit documents with titles and content that match the query
-        Example use cases: 
-        - "Berapa saja panjang submarine pipeline yang ada di IT semarang ?"
-        - "Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?"
-        DO NOT try to answer questions about specific permits without calling this tool first.""",
-        func=get_permit_document_content,
-        coroutine=get_permit_document_content
-        ),
+    # Tool(
+    #     name="get_permit_document_content",
+    #     description="""CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information.
+    #     Input: A search query or relevant keywords from the question
+    #     Returns: Top 10 relevant permit documents with titles and content that match the query
+    #     Example use cases: 
+    #     - "Berapa saja panjang submarine pipeline yang ada di IT semarang ?"
+    #     - "Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?"
+    #     DO NOT try to answer questions about specific permits without calling this tool first.""",
+    #     func=get_permit_document_content,
+    #     coroutine=get_permit_document_content
+    #     ),
+        get_permit_document_content,
         get_current_year,
         get_current_year_month,
         get_list_documents_by_issue_year,

@@ -205,6 +205,59 @@ class AzureAISearch:
 
         return await self._make_request(payload)
 
+    async def semantic_ranking_search_with_filter(
+                                      self,
+                                      keyword: str,
+                                      k: int = 5,
+                                      select_fields: List[str] | None = None,
+                                      filenames: List[str] | None = None
+    ) -> Dict[str, Any]:
+        """
+        Perform a semantic ranking search using keyword search.
+
+        Args:
+            keyword (str): The keyword to search with.
+            k (int): Number of nearest neighbors to retrieve. Defaults to 5.
+            select_fields : Fields to select in the response.
+        """
+
+        if select_fields is None:
+            raise ValueError("select_fields must be provided")
+
+        if filenames:
+            filter_str = f"search.in(title, '{','.join(filenames)}', ',')"
+        else:
+            filter_str = ""
+
+        payload: Dict[str, Any] = {
+            "count": True,
+            "vectorQueries": [
+                {
+                    "kind": app_settings.azure_aisearch.vectorizable_text_query_kind,
+                    "text": keyword,
+                    "fields": app_settings.azure_aisearch.vector_columns,
+                    "queryRewrites": app_settings.azure_aisearch.query_rewrites,
+                    "exhaustive": True,
+                    "weight": 10,
+                    "k": 5
+                }
+            ],
+            "search": keyword,
+            "queryType": "semantic",
+            "captions": app_settings.azure_aisearch.query_captions,
+            "answers": app_settings.azure_aisearch.query_answers,
+            "semanticConfiguration": app_settings.azure_aisearch.semantic_search_config,
+            "searchFields": app_settings.azure_aisearch.query_fields,
+            "scoringProfile": app_settings.azure_aisearch.scoring_profile_config,
+            "queryLanguage": app_settings.azure_aisearch.query_language,
+            "select": ", ".join(select_fields),
+            "filter": filter_str,
+            "queryRewrites": app_settings.azure_aisearch.query_rewrites,
+            "debug": "queryRewrites"
+        }
+
+        return await self._make_request(payload)
+
 retrieval_client = AzureAISearch(
     base_url=app_settings.azure_aisearch.endpoint or "",
     api_key=app_settings.azure_aisearch.key or "",

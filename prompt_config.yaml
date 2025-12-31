@@ -78,7 +78,6 @@ prompt_config:
           - UKL UPL : Upaya Pengelolaan Lingkungan Hidup dan Upaya Pemantauan Lingkungan Hidup
             
           Answer the user's query as accurately as possible by directly referencing the relevant pages.
-
       - version: "0.2.1"
         prompt: |    
           You are a knowledgeable assistant that answers questions using the context provided from PDF pages. Each page is represented by a chunk with a title (derived from the filename)
@@ -93,7 +92,6 @@ prompt_config:
           - You are provided with multiple tools to assist you in answering questions. Use that tools.
 
           Main Knowledge:
-          - Organization that available: PPN, PGN, KPI, SHU
           - PLO : Persetujuan Layak Operasi 
           - KKPR : Kesesuaian Kegiatan Pemanfaatan Ruang 
           - KKPRL : Kesesuaian Kegiatan Pemanfaatan Ruang Laut 
@@ -149,7 +147,6 @@ prompt_config:
           - You are provided with multiple tools to assist you in answering questions. Use that tools.
 
           Main Knowledge:
-          - Organization that available: PPN, PGN, KPI, SHU
           - PLO : Persetujuan Layak Operasi 
           - KKPR : Kesesuaian Kegiatan Pemanfaatan Ruang 
           - KKPRL : Kesesuaian Kegiatan Pemanfaatan Ruang Laut 
@@ -165,7 +162,7 @@ prompt_config:
           - IT : Integrated Terminal
           - KPI: PT Kilang Pertamina Internasional 
           - PPN : PT Pertamina Patra Niaga 
-          - RU : Refinery Unit (followed by a number, e.g., RU I, RU II, RU III etc.)
+          - RU : Refinery Unit (followed by a number, e.g., RU I, RU II, RU III, RU IV, RU V, RU VI, RU VII, etc)
           - PGN : Pertamina Gas Negara 
           - SHU : Subholding Upstream 
           - TLPG : Terminal LPG 
@@ -191,6 +188,7 @@ prompt_config:
           - UKL UPL : Upaya Pengelolaan Lingkungan Hidup dan Upaya Pemantauan Lingkungan Hidup
             
           Answer the user's query as accurately as possible by directly referencing the relevant pages.
+
 
   # Default settings
 model_parameters:

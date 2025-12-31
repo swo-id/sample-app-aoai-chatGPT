@@ -1,6 +1,6 @@
 """ Permit Metdata Class Implementation in Cosmos DB """
 from datetime import datetime
-from typing import Literal, Optional, Any
+from typing import Literal, Optional, Any, List
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos import exceptions
 from backend.settings import app_settings
@@ -78,6 +78,7 @@ class CosmosPermitMetaData():
             self,
             permit_type: Literal['PLO', 'KKPR', 'KKPRL', 'Ijin Lingkungan'] | None = None,
             year: int | None = None,
+            month: int | None = None,
             organization: Optional[str] = None,
             operator: Literal['equal', 'greater', 'less'] | None = None,
             order_by: Optional[Literal['latest', 'earliest']] = 'latest'
@@ -86,25 +87,37 @@ class CosmosPermitMetaData():
         Get list of documents that issued in based on year and optionally filtered by permit type and organization.
 
         Args:
-            target_year (int): Target document issued year.
+            year (int): Target document issued year.
+            month (int, optional): Target document issued month.
             document_type (str, optional): Type of document to filter by PLO, KKPR, KKPRL, Ijin Lingkungan.
             operator (str, optional): Comparison operator ('equal', 'greater', 'less').
+            order_by (str, optional): Order by 'latest' or 'earliest'.
+            organization (str, optional): Organization to filter by.
 
         Example use cases:
             - Sebutkan PLO (CA TAHUN 2020) PMO PGN beserta Lokasinya : {"organization" : "PGN CA tahun 2020", "permit_type": "PLO", "year": 2020}
             - Sebutkan RU yang dokumen KKPRLnya di terbitkan pada tahun 2023! : {"organization" : "RU", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
             - Sebutkan Instalasi milik PGN yang memiliki KKPR dengan tanggal terbit paling lama ! : {"organization" : "PGN", "permit_type" : "KKPR", "order_by" : "earliest"}
+            - Apa saja Instalasi DPPU yang dokumen KKPR nya di terbitkan pada tahun 2023 ? : {"organization" : "DPPU", "permit_type" : "KKPR", "operator" : "equal", "year" : 2023}
+            - Sebutkan KKPR mana saja yang di terbitkan pada tahun 2024 pada cluster non PMO ! : {"organization" : "Non Cluster PMO", "permit_type" : "KKPR", "operator" : "equal", "year" : 2024}
+            - Sebutkan nomor KKPRL milik SH PGN yang di terbitkan pada tahun 2023 ! : {"organization" : "PGN", "permit_type" : "KKPRL", "operator" : "equal", "year" : 2023}
+            - Sebutkan instalasi milik SHU yang Persetujuan Lingkungannya diperbaharui paling baru ! : {'organization': 'SHU', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+            - Sebutkan Persetujuan Lingkungan milik SH PGN yang terakhir kali di perbaharui ! : {'organization': 'PGN', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+            - Kapan terakhir persetujuan lingkungan di EP Asset 1- Field Jambi diperbaharui ? : {'organization': 'Field Jambi', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
+            - Kapan saja dokumen UKL UPL di FT Bandung Group - Padalarang di perbaharui ? : {'organization': 'FT Bandung - Padalarang', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
         """
 
         query = """
-               SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
-                    p.issueDate, p.permitSummary, p.permitNumber
-                FROM c
-                JOIN p IN c.permits
-                """
+            SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
+                p.issueDate, p.permitSummary, p.permitNumber
+            FROM c
+            JOIN p IN c.permits
+            WHERE p.issueDate != ""
+        """
 
         conditions = []
         parameters: list[dict[str, object]] = []
+        items = []
 
         if permit_type:
             conditions.append("c.permitType = @permitType")
@@ -123,16 +136,38 @@ class CosmosPermitMetaData():
             else:  # equal
                 conditions.append("YEAR(p.issueDate) = @year")
 
+        if year and month:
+            parameters.append(dict(name="@month", value=month))
+            conditions.append("MONTH(p.issueDate) = @month")
+
         if organization:
             await self._ensure_main_organizations_loaded()
             if organization.strip() in self.main_organization:
                 conditions.append("c.organization = @organization")
                 parameters.append(dict(name="@organization", value=organization))
             else:
+                conditions.append("RegexMatch(c.filepath, @organization, 'i')")
+                parameters.append(dict(name="@organization", value=organization))
+
+            query_with_condition = query + " AND " + " AND ".join(conditions)
+
+            iterators = self.container_client.query_items(
+                query=query_with_condition,
+                parameters=parameters,
+                # enable_cross_partition_query=True
+            )
+
+            # iterate results
+            async for item in iterators:
+                items.append(item)
+
+            if not items:
+                # Fallback to title search if no items found
+                conditions = conditions[:-1]  # Remove last organization condition
                 title_file_search = await title_search_client.full_text_search(
                     keyword=organization.strip(),
                     select_fields=["title", "titleWithExtension"],
-                    search_fields=["title", "titleWithExtension"],
+                    search_fields=["title"],
                     top=10
                 )
 
@@ -140,33 +175,33 @@ class CosmosPermitMetaData():
                 title_str = ",".join([f"'{t}'" for t in list_of_titles])
                 conditions.append(f"c.documentTitle IN ({title_str})")
 
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+                query += " AND " + " AND ".join(conditions)
 
-        iterators = self.container_client.query_items(
-            query=query,
-            parameters=parameters,
-            # enable_cross_partition_query=True
-        )
+                iterators = self.container_client.query_items(
+                    query=query,
+                    parameters=parameters,
+                    # enable_cross_partition_query=True
+                )
 
-        # iterate results
-        items = []
-        async for item in iterators:
-            items.append(item)
+                # iterate results
+                async for item in iterators:
+                    items.append(item)
 
+                if not items:
+                    return "No documents found issued in this year."
 
-        if not items:
-            return "No documents found issued in this year."
-
+        doc_len = 20
         if order_by == 'latest':
             items.sort(key=lambda x: x.get('issueDate', ''), reverse=True)
         else:  # earliest
             items.sort(key=lambda x: x.get('issueDate', ''))
 
-        result_list = [f"List of documents issued is {len(items)} items:"]
-        for item in items:
+        filtered_items = items[:doc_len]
+
+        result_list = [f"List of documents issued is {len(filtered_items)} items:"]
+        for item in filtered_items:
             result_list.append(
-            f"- {item['documentTitle']} - {item['permitNumber']} "
+            f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
             f"\n  (Org: {item['organization']}, Issue Date: {item['issueDate']})"
             f"\n  Document path: {item.get('filepath', 'N/A')} "
             f"\n  Summary: {item['permitSummary']}"
@@ -265,7 +300,7 @@ class CosmosPermitMetaData():
         result_list = []
         for item in items:
             result_list.append(
-                f"- {item['documentTitle']} - {item['permitNumber']} "
+                f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
                 f"\n  (Org: {item['organization']}, Expires: {item['expirationDate']})"
                 f"\n  Document path: {item.get('filepath', 'N/A')} "
                 f"\n  Summary: {item['permitSummary']}"
@@ -279,7 +314,7 @@ class CosmosPermitMetaData():
             order_by: Optional[Literal['latest', 'earliest']] = 'latest'
     ):
         """
-        Get list of documents that have already expired.
+        Get list of documents that have already expired. This is only for PLO document types.
 
         Args:
             organization (str, optional): Organization to filter by.
@@ -473,7 +508,7 @@ class CosmosPermitMetaData():
                 title_file_search = await title_search_client.full_text_search(
                     keyword=organization.strip(),
                     select_fields=["title", "titleWithExtension"],
-                    search_fields=["title", "titleWithExtension"],
+                    search_fields=["title"],
                     top=10
                 )
 
@@ -494,33 +529,97 @@ class CosmosPermitMetaData():
         async for item in results:
             items.append(item)
 
-        search_results = await retrieval_client.semantic_ranking_search(
-            keyword=keyword,
-            k=10, # number of top documents to retrieve
-            select_fields=["title", "content"]
-        )
-
-        docs = [doc['content'] for doc in search_results['value']]
-        title = [doc['title'] for doc in search_results['value']]
+        doc_len = 30
 
         if not items:
-            return "No documents found for the specified organization."
+            result_list =  ["No documents found for the specified organization."]
+        else:
+            filtered_items = items[:doc_len]
+            result_list = [f"List of documents for organization {organization} items:"]
+            if permit_type == 'PLO': # PLO has expiration date
+                for item in filtered_items:
+                    result_list.append(
+                        f"- {item['documentTitle']} "
+                        f"\n  - Permit Number: {item['permitNumber']} "
+                        f"\n  - (Org: {item['organization']}, Issue Date: {item['issueDate']}, Expiration Date: {item['expirationDate']})"
+                        f"\n  - Document path: {item.get('filepath', 'N/A')} "
+                        f"\n  - Summary: {item['permitSummary']}"
+                    )
+            else:
+                for item in items:
+                    result_list.append(
+                        f"- {item['documentTitle']} "
+                        f"\n  - Permit Number: {item['permitNumber']} "
+                        f"\n  - (Org: {item['organization']}, Issue Date: {item['issueDate']})"
+                        f"\n  - Document path: {item.get('filepath', 'N/A')} "
+                        f"\n  - Summary: {item['permitSummary']}"
+                    )
 
-        result_list = [f"List of documents for organization {organization} is {len(items)} items:"]
-        for item in items:
-            result_list.append(
-                f"- {item['documentTitle']} - {item['permitNumber']} "
-                f"\n  (Org: {item['organization']}, Issue Date: {item['issueDate']}, Expiration Date: {item['expirationDate']})"
-                f"\n  Document path: {item.get('filepath', 'N/A')} "
-                f"\nSummary: {item['permitSummary']}"
-            )
-
-        vector_result = "\n".join([f"{t}: {d}" for t, d in zip(title, docs)])
         cosmos_result = "\n".join(result_list)
 
-        final_result = f"Content Search Results:\n{vector_result}\n\nMetadata DB Results:\n{cosmos_result}"
+        final_result = f"========Metadata DB Results========:\n\n{cosmos_result}"
 
         return final_result
+
+    async def get_non_empty_issue_date_document(
+            self,
+            organization: Optional[str] | None = None
+    ) -> List[str]:
+        """
+        Get list of documents that have non-empty issueDate, optionally filtered by organization.
+
+        Args:
+            organization (str, optional): Organization to filter by.
+        Return:
+            list[str]: List of filenames.
+        """
+
+        conditions = []
+        parameters = []
+        filenames: List[str] = []
+
+        query = """
+                SELECT c.documentTitle, c.permitType, c.organization, c.filepath, p.issueDate
+                FROM c
+                JOIN p IN c.permits
+                WHERE p.issueDate != ""
+            """
+        if organization:
+            await self._ensure_main_organizations_loaded()
+            if organization.strip() in self.main_organization:
+                conditions.append("c.organization = @organization")
+                parameters.append(dict(name="@organization", value=organization))
+            else:
+                conditions.append("RegexMatch(c.filepath, @organization, 'i')")
+                parameters.append(dict(name="@organization", value=organization))
+
+            query_with_condition = query + " AND " + " AND ".join(conditions)
+
+            results = cosmos_client.container_client.query_items(
+                query=query_with_condition,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            )
+
+            items = []
+            async for item in results:
+                items.append(item)
+
+            filenames = [item['filepath'] for item in items]
+
+            if not items:
+                # Fallback to title search if no items found
+                conditions = conditions[:-1]  # Remove last organization condition
+                title_file_search = await title_search_client.full_text_search(
+                    keyword=organization.strip(),
+                    select_fields=["title", "titleWithExtension"],
+                    search_fields=["title"],
+                    top=15
+                )
+
+                filenames = [doc['title'] for doc in title_file_search['value']]
+
+        return filenames
 
 cosmos_client = CosmosPermitMetaData(
     cosmosdb_endpoint=f"https://{app_settings.permit_metadata.account}.documents.azure.com:443/",
