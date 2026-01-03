@@ -550,12 +550,18 @@ async def complete_chat_requestV2(request_body, request_headers):
             messages = clean_messages(request_body.get("messages", []))
             history_metadata = request_body.get("history_metadata", {})
 
+            # Use unique thread_id to avoid state conflicts
+            thread_id = str(uuid.uuid4())
+
             # invoke Agent
             if app_settings.langfuse.enable:
 
                 agent_response = await agent.ainvoke(
                     {"messages": messages},
-                    config={"recursion_limit": 10, "callbacks": [CB]}
+                    config={
+                        "recursion_limit": 10,
+                        "callbacks": [CB],
+                        "configurable": {"thread_id": thread_id}}
                 )
 
                 LF.flush()
@@ -563,11 +569,11 @@ async def complete_chat_requestV2(request_body, request_headers):
             else:
                 agent_response = await agent.ainvoke(
                     {"messages": messages},
-                    config={"recursion_limit": 10}
+                    config={"recursion_limit": 10, "configurable": {"thread_id": thread_id}}
                 )
 
             non_streaming_response = format_non_streaming_responseV2(
-                agent_response['messages'][-1],
+                agent_response,
                 history_metadata,
                 'agent-generated'
              )

@@ -1,17 +1,18 @@
 '''agent'''
 from datetime import datetime
 from typing import Literal, Optional
+import json
 
-from langchain_core.tools import tool, Tool
+from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
 from backend.agent.config import AgentConfiguration
-from backend.settings import app_settings
-from backend.aisearch.aisearch import retrieval_client, title_search_client
+from backend.aisearch.aisearch import retrieval_client
+from backend.aisearch.model import Document
 from backend.metadata.cosmos_db_service import cosmos_client
-
+from backend.settings import app_settings
 
 config_agent = AgentConfiguration()
 
@@ -49,21 +50,28 @@ async def get_permit_document_content(keyword: str, organization: Optional[str] 
     - Sebutkan instalasi mana saja yang dilalui oleh pipa penyalur Cilacap - Bandung ! : {"keyword" : "pipa penyalur Cilacap - Bandung", "organization": "Cilacap Bandung"}
     - Apa saja instalasi yang teramasuk instalasi STRANAS menurut dokumen KKPR nya ? : {"keyword" : "instalasi STRANAS KKPR", "organization": "STRANAS"}
     """
+    try:
 
-    filenames = await cosmos_client.get_non_empty_issue_date_document(organization=organization)
+        filenames = await cosmos_client.get_non_empty_issue_date_document(organization=organization)
 
-    ## Change retrieval method and configuration as needed
-    search_results = await retrieval_client.semantic_ranking_search_with_filter(
-        keyword=keyword,
-        k=10, # number of top documents to retrieve
-        select_fields = ["title", "content"],
-        filenames = filenames
-    )
+        ## Change retrieval method and configuration as needed
+        search_results = await retrieval_client.semantic_ranking_search_with_filter(
+            keyword=keyword,
+            k=10, # number of top documents to retrieve
+            select_fields = ["id", "title", "content", "filepath", "chunkingId"],
+            filenames = filenames
+        )
 
-    docs = [doc['content'] for doc in search_results['value']]
-    title = [doc['title'] for doc in search_results['value']]
+        values = search_results['value']
+        data = []
+        if len(values) > 0:
+            for item in values:
+                data.append(Document(**item).model_dump())
 
-    return "\n".join([f"{t}: {d}" for t, d in zip(title, docs)])
+        return json.dumps(data)
+
+    except Exception as e:
+        return f"Error get permit document content: {e}"
 
 @tool
 def get_current_year():
@@ -220,18 +228,6 @@ async def get_list_all_documents_by_organization(
         )
 
 tools = [
-    # Tool(
-    #     name="get_permit_document_content",
-    #     description="""CRITICAL: Use this tool FIRST when the user asks ANY question about permits, permit content, or specific permit information.
-    #     Input: A search query or relevant keywords from the question
-    #     Returns: Top 10 relevant permit documents with titles and content that match the query
-    #     Example use cases: 
-    #     - "Berapa saja panjang submarine pipeline yang ada di IT semarang ?"
-    #     - "Berapa kedalaman yang di tertera pada dokumen KKPRL untuk IT Jakarta ?"
-    #     DO NOT try to answer questions about specific permits without calling this tool first.""",
-    #     func=get_permit_document_content,
-    #     coroutine=get_permit_document_content
-    #     ),
         get_permit_document_content,
         get_current_year,
         get_current_year_month,

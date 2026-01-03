@@ -1,10 +1,16 @@
 """ Permit Metdata Class Implementation in Cosmos DB """
 from datetime import datetime
 from typing import Literal, Optional, Any, List
+import json
+import logging
+
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos import exceptions
+from pydantic import ValidationError
+
+from backend.aisearch.aisearch import title_search_client
+from backend.metadata.models import PLOMetaDataInDB, PermitMetaDataInDB
 from backend.settings import app_settings
-from backend.aisearch.aisearch import title_search_client, retrieval_client
 
 class CosmosPermitMetaData():
     """ Permit Metadata Cosmos DB realization """
@@ -106,79 +112,52 @@ class CosmosPermitMetaData():
             - Kapan terakhir persetujuan lingkungan di EP Asset 1- Field Jambi diperbaharui ? : {'organization': 'Field Jambi', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
             - Kapan saja dokumen UKL UPL di FT Bandung Group - Padalarang di perbaharui ? : {'organization': 'FT Bandung - Padalarang', 'permit_type': 'Ijin Lingkungan', 'order_by': 'latest'}
         """
+        try:
+            query = """
+                SELECT c.id, c.documentTitle, c.permitType, c.organization, c.filepath, c.permits, c.keywords
+                FROM c
+                JOIN p IN c.permits
+                WHERE p.issueDate != ""
+            """
 
-        query = """
-            SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
-                p.issueDate, p.permitSummary, p.permitNumber
-            FROM c
-            JOIN p IN c.permits
-            WHERE p.issueDate != ""
-        """
+            conditions = []
+            parameters: list[dict[str, object]] = []
+            items = []
 
-        conditions = []
-        parameters: list[dict[str, object]] = []
-        items = []
+            if permit_type:
+                conditions.append("c.permitType = @permitType")
+                parameters.append({"name": "@permitType", "value": permit_type})
 
-        if permit_type:
-            conditions.append("c.permitType = @permitType")
-            parameters.append({"name": "@permitType", "value": permit_type})
+            if operator and year:
+                if year is None:
+                    year = datetime.now().year
 
-        if operator and year:
-            if year is None:
-                year = datetime.now().year
+                parameters.append({"name": "@year", "value": year})
 
-            parameters.append({"name": "@year", "value": year})
+                if operator == 'greater':
+                    conditions.append("YEAR(p.issueDate) >= @year")
+                elif operator == 'less':
+                    conditions.append("YEAR(p.issueDate) <= @year")
+                else:  # equal
+                    conditions.append("YEAR(p.issueDate) = @year")
 
-            if operator == 'greater':
-                conditions.append("YEAR(p.issueDate) >= @year")
-            elif operator == 'less':
-                conditions.append("YEAR(p.issueDate) <= @year")
-            else:  # equal
-                conditions.append("YEAR(p.issueDate) = @year")
+            if year and month:
+                parameters.append(dict(name="@month", value=month))
+                conditions.append("MONTH(p.issueDate) = @month")
 
-        if year and month:
-            parameters.append(dict(name="@month", value=month))
-            conditions.append("MONTH(p.issueDate) = @month")
+            if organization:
+                await self._ensure_main_organizations_loaded()
+                if organization.strip() in self.main_organization:
+                    conditions.append("c.organization = @organization")
+                    parameters.append(dict(name="@organization", value=organization))
+                else:
+                    conditions.append("RegexMatch(c.filepath, @organization, 'i')")
+                    parameters.append(dict(name="@organization", value=organization))
 
-        if organization:
-            await self._ensure_main_organizations_loaded()
-            if organization.strip() in self.main_organization:
-                conditions.append("c.organization = @organization")
-                parameters.append(dict(name="@organization", value=organization))
-            else:
-                conditions.append("RegexMatch(c.filepath, @organization, 'i')")
-                parameters.append(dict(name="@organization", value=organization))
-
-            query_with_condition = query + " AND " + " AND ".join(conditions)
-
-            iterators = self.container_client.query_items(
-                query=query_with_condition,
-                parameters=parameters,
-                # enable_cross_partition_query=True
-            )
-
-            # iterate results
-            async for item in iterators:
-                items.append(item)
-
-            if not items:
-                # Fallback to title search if no items found
-                conditions = conditions[:-1]  # Remove last organization condition
-                title_file_search = await title_search_client.full_text_search(
-                    keyword=organization.strip(),
-                    select_fields=["title", "titleWithExtension"],
-                    search_fields=["title"],
-                    top=10
-                )
-
-                list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
-                title_str = ",".join([f"'{t}'" for t in list_of_titles])
-                conditions.append(f"c.documentTitle IN ({title_str})")
-
-                query += " AND " + " AND ".join(conditions)
+                query_with_condition = query + " AND " + " AND ".join(conditions)
 
                 iterators = self.container_client.query_items(
-                    query=query,
+                    query=query_with_condition,
                     parameters=parameters,
                     # enable_cross_partition_query=True
                 )
@@ -188,26 +167,71 @@ class CosmosPermitMetaData():
                     items.append(item)
 
                 if not items:
-                    return "No documents found issued in this year."
+                    # Fallback to title search if no items found
+                    conditions = conditions[:-1]  # Remove last organization condition
+                    title_file_search = await title_search_client.full_text_search(
+                        keyword=organization.strip(),
+                        select_fields=["title", "titleWithExtension"],
+                        search_fields=["title"],
+                        top=10
+                    )
 
-        doc_len = 20
-        if order_by == 'latest':
-            items.sort(key=lambda x: x.get('issueDate', ''), reverse=True)
-        else:  # earliest
-            items.sort(key=lambda x: x.get('issueDate', ''))
+                    list_of_titles = [
+                        doc['titleWithExtension'] for doc in title_file_search['value']
+                    ]
 
-        filtered_items = items[:doc_len]
+                    title_str = ",".join([f"'{t}'" for t in list_of_titles])
+                    conditions.append(f"c.documentTitle IN ({title_str})")
 
-        result_list = [f"List of documents issued is {len(filtered_items)} items:"]
-        for item in filtered_items:
-            result_list.append(
-            f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
-            f"\n  (Org: {item['organization']}, Issue Date: {item['issueDate']})"
-            f"\n  Document path: {item.get('filepath', 'N/A')} "
-            f"\n  Summary: {item['permitSummary']}"
-        )
+                    query += " AND " + " AND ".join(conditions)
 
-        return "\n".join(result_list)
+                    iterators = self.container_client.query_items(
+                        query=query,
+                        parameters=parameters,
+                        # enable_cross_partition_query=True
+                    )
+
+                    # iterate results
+                    async for item in iterators:
+                        items.append(item)
+
+                    if not items:
+                        # return "No documents found issued in this year."
+                        json.dumps([])
+
+            doc_len = 20
+            if order_by == 'latest':
+                items.sort(key=lambda x: x.get('issueDate', ''), reverse=True)
+            else:  # earliest
+                items.sort(key=lambda x: x.get('issueDate', ''))
+
+            filtered_items = items[:doc_len]
+            result_list: list[dict]= []
+            for item in filtered_items:
+                if item['permitType'] == 'PLO':
+                    permit = PLOMetaDataInDB(**item)
+                else:
+                    permit = PermitMetaDataInDB(**item)
+
+                result_list.append(permit.to_dict())
+
+            return json.dumps(result_list)
+
+        except ValidationError as e:
+            logging.error("Error - validation - get_list_documents_by_issue_year: %s", str(e))
+            return f"Validation Error: {str(e)}"
+
+        except exceptions.CosmosResourceNotFoundError as e:
+            logging.error("Error - DB - get_list_documents_by_issue_year: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error("Error - DB - get_list_documents_by_issue_year: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except Exception as e:
+            logging.error("Error - get_list_documents_by_issue_year: %s", str(e))
+            return f"Error: {str(e)}"
 
     async def get_list_documents_by_expiration_year(
             self,
@@ -231,82 +255,101 @@ class CosmosPermitMetaData():
             - Sebutkan area pada PGN SOR 1 yang paling cepat akan kadaluwarsa dan kapan kadaluwarsanya?: {"organization": "PGN SOR 1", "order_by": "earliest", "operator": "greater"}
 
         """
+        try:
 
-        query = """
-            SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
-                p.expirationDate, p.permitSummary, p.permitNumber
-            FROM c
-            JOIN p IN c.permits
-        """
+            query = """
+                SELECT c.id, c.documentTitle, c.permitType, c.organization, c.filepath, c.permits, c.keywords
+                FROM c
+                JOIN p in c.permits
+            """
 
-        conditions = []
-        parameters: list[dict[str, object]] = []
+            conditions = []
+            parameters: list[dict[str, object]] = []
 
-        if permit_type:
-            conditions.append("c.permitType = @permitType")
-            parameters.append({"name": "@permitType", "value": permit_type})
+            if permit_type:
+                conditions.append("c.permitType = @permitType")
+                parameters.append({"name": "@permitType", "value": permit_type})
 
-        if operator:
-            if year is None:
-                year = datetime.now().year
-            parameters.append({"name": "@year", "value": year})
+            if operator:
+                if year is None:
+                    year = datetime.now().year
+                parameters.append({"name": "@year", "value": year})
 
-            if operator == 'greater':
-                conditions.append("YEAR(p.expirationDate) >= @year")
-            elif operator == 'less':
-                conditions.append("YEAR(p.expirationDate) <= @year")
-            else:  # equal
-                conditions.append("YEAR(p.expirationDate) = @year")
+                if operator == 'greater':
+                    conditions.append("YEAR(p.expirationDate) >= @year")
+                elif operator == 'less':
+                    conditions.append("YEAR(p.expirationDate) <= @year")
+                else:  # equal
+                    conditions.append("YEAR(p.expirationDate) = @year")
 
-        if organization:
-            await self._ensure_main_organizations_loaded()
-            if organization.strip() in self.main_organization:
-                conditions.append("c.organization = @organization")
-                parameters.append({"name": "@organization", "value": organization})
-            else:
-                title_file_search = await title_search_client.full_text_search(
-                    keyword=organization.strip(),
-                    select_fields=["title", "titleWithExtension"],
-                    search_fields=["title", "titleWithExtension"],
-                    top=10
-                )
+            if organization:
+                await self._ensure_main_organizations_loaded()
+                if organization.strip() in self.main_organization:
+                    conditions.append("c.organization = @organization")
+                    parameters.append({"name": "@organization", "value": organization})
+                else:
+                    title_file_search = await title_search_client.full_text_search(
+                        keyword=organization.strip(),
+                        select_fields=["title", "titleWithExtension"],
+                        search_fields=["title", "titleWithExtension"],
+                        top=10
+                    )
 
-                list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
-                title_str = ",".join([f"'{t}'" for t in list_of_titles])
-                conditions.append(f"c.documentTitle IN ({title_str})")
+                    list_of_titles = [
+                        doc['titleWithExtension'] for doc in title_file_search['value']
+                    ]
 
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+                    title_str = ",".join([f"'{t}'" for t in list_of_titles])
+                    conditions.append(f"c.documentTitle IN ({title_str})")
 
-        results = self.container_client.query_items(
-            query=query,
-            parameters=parameters,
-            # enable_cross_partition_query=True
-        )
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
 
-        # iterate results
-        items = []
-        async for item in results:
-            items.append(item)
-
-        if not items:
-            return "No documents found expiring in this year."
-
-        if order_by == 'latest':
-            items.sort(key=lambda x: x.get('expirationDate', ''), reverse=True)
-        else:  # earliest
-            items.sort(key=lambda x: x.get('expirationDate', ''))
-
-        result_list = []
-        for item in items:
-            result_list.append(
-                f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
-                f"\n  (Org: {item['organization']}, Expires: {item['expirationDate']})"
-                f"\n  Document path: {item.get('filepath', 'N/A')} "
-                f"\n  Summary: {item['permitSummary']}"
+            results = self.container_client.query_items(
+                query=query,
+                parameters=parameters,
             )
 
-        return "\n".join(result_list)
+            # iterate results
+            items = []
+            async for item in results:
+                items.append(item)
+
+            if not items:
+                # return "No documents found expiring in this year."
+                return json.dumps([])
+
+            if order_by == 'latest':
+                items.sort(key=lambda x: x.get('expirationDate', ''), reverse=True)
+            else:  # earliest
+                items.sort(key=lambda x: x.get('expirationDate', ''))
+
+            result_list: list[dict]= []
+            for item in items:
+                if item['permitType'] == 'PLO':
+                    permit = PLOMetaDataInDB(**item)
+                else:
+                    permit = PermitMetaDataInDB(**item)
+
+                result_list.append(permit.to_dict())
+
+            return json.dumps(result_list)
+
+        except ValidationError as e:
+            logging.error("Error - validation - get_list_documents_by_expiration_year: %s", str(e))
+            return f"Validation Error: {str(e)}"
+
+        except exceptions.CosmosResourceNotFoundError as e:
+            logging.error("Error - DB - get_list_documents_by_expiration_year: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error("Error - DB - get_list_documents_by_expiration_year: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except Exception as e:
+            logging.error("Error - get_list_documents_by_expiration_year: %s", str(e))
+            return f"Error: {str(e)}"
 
     async def get_list_documents_already_expired(
             self,
@@ -326,68 +369,85 @@ class CosmosPermitMetaData():
             - Sebutkan Instalasi mana saja yang PLO nya sudah kadaluwarsa di SH PPN !: {"organization" : "PPN", "order_by": "latest"}
 
         """
+        try:
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            conditions = []
+            parameters: list[dict[str, object]] = [{"name": "@currentDate", "value": current_date}]
 
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        conditions = []
-        parameters: list[dict[str, object]] = [{"name": "@currentDate", "value": current_date}]
+            query = """
+                SELECT c.id, c.documentTitle, c.permitType, c.organization, c.filepath, c.permits, c.keywords
+                FROM c
+                JOIN p in c.permits
+                WHERE p.expirationDate < @currentDate AND
+                    c.permitType = 'PLO'
+                """
 
-        query = """
-            SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
-                p.expirationDate, p.permitSummary, p.permitNumber, p.installation
-            FROM c
-            JOIN p in c.permits
-            WHERE p.expirationDate < @currentDate AND
-                c.permitType = 'PLO'
-            """
+            if organization:
+                await self._ensure_main_organizations_loaded()
+                if organization.strip() in self.main_organization:
+                    conditions.append("c.organization = @organization")
+                    parameters.append(dict(name="@organization", value=organization))
+                else:
+                    title_file_search = await title_search_client.full_text_search(
+                        keyword=organization.strip(),
+                        select_fields=["title", "titleWithExtension"],
+                        search_fields=["title", "titleWithExtension"],
+                        top=10
+                    )
 
-        if organization:
-            await self._ensure_main_organizations_loaded()
-            if organization.strip() in self.main_organization:
-                conditions.append("c.organization = @organization")
-                parameters.append(dict(name="@organization", value=organization))
-            else:
-                title_file_search = await title_search_client.full_text_search(
-                    keyword=organization.strip(),
-                    select_fields=["title", "titleWithExtension"],
-                    search_fields=["title", "titleWithExtension"],
-                    top=10
-                )
+                    list_of_titles = [
+                        doc['titleWithExtension'] for doc in title_file_search['value']
+                    ]
+                    title_str = ",".join([f"'{t}'" for t in list_of_titles])
+                    conditions.append(f"c.documentTitle IN ({title_str})")
 
-                list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
-                title_str = ",".join([f"'{t}'" for t in list_of_titles])
-                conditions.append(f"c.documentTitle IN ({title_str})")
+            if conditions:
+                query += " AND " + " AND ".join(conditions)
 
-        if conditions:
-            query += " AND " + " AND ".join(conditions)
-
-        results = self.container_client.query_items(
-            query=query,
-            parameters=parameters,
-            # enable_cross_partition_query=True
-        )
-
-        items = []
-        async for item in results:
-            items.append(item)
-
-        if not items:
-            return "No documents have expired."
-
-        if order_by == 'latest':
-            items.sort(key=lambda x: x.get('expirationDate', ''), reverse=True)
-        else:  # earliest
-            items.sort(key=lambda x: x.get('expirationDate', ''))
-
-        result_list = [f"Now is {current_date}. The following documents have already expired:"]
-        for item in items:
-            result_list.append(
-                f"- {item['documentTitle']} - Permit Number: {item['permitNumber']} "
-                f"\n  (Org: {item['organization']}, Installation {item.get('installation', 'N/A')}, Expired: {item['expirationDate']})"
-                f"\n  Document path: {item.get('filepath', 'N/A')} "
-                f"\n  Summary: {item['permitSummary']}"
+            results = self.container_client.query_items(
+                query=query,
+                parameters=parameters
             )
 
-        return "\n".join(result_list)
+            items = []
+            async for item in results:
+                items.append(item)
+
+            if not items:
+                # return "No documents have expired."
+                return json.dumps([])
+
+            if order_by == 'latest':
+                items.sort(key=lambda x: x.get('expirationDate', ''), reverse=True)
+            else:  # earliest
+                items.sort(key=lambda x: x.get('expirationDate', ''))
+
+            result_list: list[dict]= []
+            for item in items:
+                if item['permitType'] == 'PLO':
+                    permit = PLOMetaDataInDB(**item)
+                else:
+                    permit = PermitMetaDataInDB(**item)
+
+                result_list.append(permit.to_dict())
+
+            return json.dumps(result_list)
+
+        except ValidationError as e:
+            logging.error("Error - validation - get_list_documents_already_expired: %s", str(e))
+            return f"Validation Error: {str(e)}"
+
+        except exceptions.CosmosResourceNotFoundError as e:
+            logging.error("Error - DB - get_list_documents_already_expired: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error("Error - DB - get_list_documents_already_expired: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except Exception as e:
+            logging.error("Error - get_list_documents_already_expired: %s", str(e))
+            return f"Error: {str(e)}"
 
     async def get_list_document_by_expiration_interval(
             self,
@@ -403,67 +463,85 @@ class CosmosPermitMetaData():
             organization (str, optional): Organization to filter by.
             permit_type (str, optional): Type of permit to filter by. PLO document types only.
         """
+        try:
 
-        query = """
-            SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
-                p.issueDate, p.expirationDate, p.permitSummary, p.permitNumber, p.installation
-            FROM c
-            JOIN p in c.permits
-            WHERE p.expirationDate >= GetCurrentDateTime()
-                AND p.expirationDate <= DateTimeAdd("mm", @months_ahead, GetCurrentDateTime())
-                AND c.permitType = @documentType
-            """
+            query = """
+                SELECT c.id, c.filepath, c.documentTitle, c.organization, c.keywords, c.permitType, c.permits
+                FROM c
+                JOIN p in c.permits
+                WHERE p.expirationDate >= GetCurrentDateTime()
+                    AND p.expirationDate <= DateTimeAdd("mm", @months_ahead, GetCurrentDateTime())
+                    AND c.permitType = @documentType
+                """
 
-        conditions = []
-        parameters = []
+            conditions = []
+            parameters = []
 
-        parameters.append(dict(name="@months_ahead", value=months_ahead))
-        parameters.append(dict(name="@documentType", value=permit_type))
+            parameters.append(dict(name="@months_ahead", value=months_ahead))
+            parameters.append(dict(name="@documentType", value=permit_type))
 
-        if organization:
-            await self._ensure_main_organizations_loaded()
-            if organization.strip() in self.main_organization:
-                conditions.append("c.organization = @organization")
-                parameters.append(dict(name="@organization", value=organization))
-            else:
-                title_file_search = await title_search_client.full_text_search(
-                    keyword=organization.strip(),
-                    select_fields=["title", "titleWithExtension"],
-                    search_fields=["title"],
-                    top=10
-                )
+            if organization:
+                await self._ensure_main_organizations_loaded()
+                if organization.strip() in self.main_organization:
+                    conditions.append("c.organization = @organization")
+                    parameters.append(dict(name="@organization", value=organization))
+                else:
+                    title_file_search = await title_search_client.full_text_search(
+                        keyword=organization.strip(),
+                        select_fields=["title", "titleWithExtension"],
+                        search_fields=["title"],
+                        top=10
+                    )
 
-                list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
-                title_str = ",".join([f"'{t}'" for t in list_of_titles])
-                conditions.append(f"c.documentTitle IN ({title_str})")
+                    list_of_titles = [
+                        doc['titleWithExtension'] for doc in title_file_search['value']
+                    ]
 
-        if conditions:
-            query += " AND " + " AND ".join(conditions)
+                    title_str = ",".join([f"'{t}'" for t in list_of_titles])
+                    conditions.append(f"c.documentTitle IN ({title_str})")
 
-        results = self.container_client.query_items(
-            query=query,
-            parameters=parameters
-            # enable_cross_partition_query=True
-        )
+            if conditions:
+                query += " AND " + " AND ".join(conditions)
 
-        items = []
-        async for item in results:
-            items.append(item)
-
-
-        if not items:
-            return f"No documents found expiring in the next {months_ahead} months."
-
-        result_list = []
-        for item in items:
-            result_list.append(
-                f"- {item['documentTitle']} - {item['permitNumber']} "
-                f"\n  (Org: {item['organization']}, Expires: {item['expirationDate']})"
-                f"\n  Document path: {item.get('filepath', 'N/A')} "
-                f"\n  Summary: {item['permitSummary']}"
+            results = self.container_client.query_items(
+                query=query,
+                parameters=parameters
             )
 
-        return "\n".join(result_list)
+            items = []
+            async for item in results:
+                items.append(item)
+
+            if not items:
+                # return f"No documents found expiring in the next {months_ahead} months."
+                return json.dumps([])
+
+            result_list: list[dict]= []
+            for item in items:
+                if item['permitType'] == 'PLO':
+                    permit = PLOMetaDataInDB(**item)
+                else:
+                    permit = PermitMetaDataInDB(**item)
+
+                result_list.append(permit.to_dict())
+
+            return json.dumps(result_list)
+
+        except ValidationError as e:
+            logging.error("Error - validation - get_list_document_by_expiration_interval: %s", str(e))
+            return f"Validation Error: {str(e)}"
+
+        except exceptions.CosmosResourceNotFoundError as e:
+            logging.error("Error - DB - get_list_document_by_expiration_interval: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error("Error - DB - get_list_document_by_expiration_interval: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except Exception as e:
+            logging.error("Error - get_list_document_by_expiration_interval: %s", str(e))
+            return f"Error: {str(e)}"
 
     async def get_list_all_documents_by_organization(
             self,
@@ -485,81 +563,81 @@ class CosmosPermitMetaData():
             - Sebutkkan nomor KKPR yang dimiliki oleh IT Balongan ! : {"organization" : "IT Balongan", "permit_type": "KKPR", "keyword": "KKPR IT Balongan"}
         """
 
-        conditions = []
-        parameters = []
+        try:
+            conditions = []
+            parameters = []
 
-        query = """
-            SELECT c.documentTitle, c.permitType, c.organization, c.filepath,
-                p.issueDate, p.expirationDate, p.permitSummary, p.permitNumber
-            FROM c
-            JOIN p in c.permits
-            """
+            query = 'SELECT * FROM c'
 
-        if permit_type:
-            conditions.append("c.permitType = @permitType")
-            parameters.append(dict(name="@permitType", value=permit_type))
+            if permit_type:
+                conditions.append("c.permitType = @permitType")
+                parameters.append(dict(name="@permitType", value=permit_type))
 
-        if organization:
-            await self._ensure_main_organizations_loaded()
-            if organization.strip() in self.main_organization:
-                conditions.append("c.organization = @organization")
-                parameters.append(dict(name="@organization", value=organization))
-            else:
-                title_file_search = await title_search_client.full_text_search(
-                    keyword=organization.strip(),
-                    select_fields=["title", "titleWithExtension"],
-                    search_fields=["title"],
-                    top=10
-                )
+            if organization:
+                await self._ensure_main_organizations_loaded()
+                if organization.strip() in self.main_organization:
+                    conditions.append("c.organization = @organization")
+                    parameters.append(dict(name="@organization", value=organization))
+                else:
+                    title_file_search = await title_search_client.full_text_search(
+                        keyword=organization.strip(),
+                        select_fields=["title", "titleWithExtension"],
+                        search_fields=["title"],
+                        top=10
+                    )
 
-                list_of_titles = [doc['titleWithExtension'] for doc in title_file_search['value']]
-                title_str = ",".join([f"'{t}'" for t in list_of_titles])
-                conditions.append(f"c.documentTitle IN ({title_str})")
+                    list_of_titles = [
+                        doc['titleWithExtension'] for doc in title_file_search['value']
+                    ]
 
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+                    title_str = ",".join([f"'{t}'" for t in list_of_titles])
+                    conditions.append(f"c.documentTitle IN ({title_str})")
 
-        results = self.container_client.query_items(
-            query=query,
-            parameters=parameters,
-            # enable_cross_partition_query=True
-        )
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
 
-        items = []
-        async for item in results:
-            items.append(item)
+            results = self.container_client.query_items(
+                query=query,
+                parameters=parameters,
+            )
 
-        doc_len = 30
+            items = []
+            async for item in results:
+                items.append(item)
 
-        if not items:
-            result_list =  ["No documents found for the specified organization."]
-        else:
+            doc_len = 30
+
+            if not items:
+                # result_list =  ["No documents found for the specified organization."]
+                return json.dumps([])
+
             filtered_items = items[:doc_len]
-            result_list = [f"List of documents for organization {organization} items:"]
-            if permit_type == 'PLO': # PLO has expiration date
-                for item in filtered_items:
-                    result_list.append(
-                        f"- {item['documentTitle']} "
-                        f"\n  - Permit Number: {item['permitNumber']} "
-                        f"\n  - (Org: {item['organization']}, Issue Date: {item['issueDate']}, Expiration Date: {item['expirationDate']})"
-                        f"\n  - Document path: {item.get('filepath', 'N/A')} "
-                        f"\n  - Summary: {item['permitSummary']}"
-                    )
-            else:
-                for item in items:
-                    result_list.append(
-                        f"- {item['documentTitle']} "
-                        f"\n  - Permit Number: {item['permitNumber']} "
-                        f"\n  - (Org: {item['organization']}, Issue Date: {item['issueDate']})"
-                        f"\n  - Document path: {item.get('filepath', 'N/A')} "
-                        f"\n  - Summary: {item['permitSummary']}"
-                    )
+            result_list: list[dict]= []
+            for item in filtered_items:
+                if item['permitType'] == 'PLO':
+                    permit = PLOMetaDataInDB(**item)
+                else:
+                    permit = PermitMetaDataInDB(**item)
 
-        cosmos_result = "\n".join(result_list)
+                result_list.append(permit.to_dict())
 
-        final_result = f"========Metadata DB Results========:\n\n{cosmos_result}"
+            return json.dumps(result_list)
 
-        return final_result
+        except ValidationError as e:
+            logging.error("Error - validation - get_list_all_documents_by_organization: %s", str(e))
+            return f"Validation Error: {str(e)}"
+
+        except exceptions.CosmosResourceNotFoundError as e:
+            logging.error("Error - DB - get_list_all_documents_by_organization: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error("Error - DB - get_list_all_documents_by_organization: %s", str(e))
+            return f"Error at DB: {str(e)}"
+
+        except Exception as e:
+            logging.error("Error - get_list_all_documents_by_organization: %s", str(e))
+            return f"Error: {str(e)}"
 
     async def get_non_empty_issue_date_document(
             self,

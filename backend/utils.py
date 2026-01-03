@@ -7,6 +7,8 @@ import time
 
 from typing import List
 
+from backend.agent.model import Citation, Citations
+
 DEBUG = os.environ.get("DEBUG", "false")
 if DEBUG.lower() == "true":
     logging.basicConfig(level=logging.DEBUG)
@@ -15,6 +17,13 @@ AZURE_SEARCH_PERMITTED_GROUPS_COLUMN = os.environ.get(
     "AZURE_SEARCH_PERMITTED_GROUPS_COLUMN"
 )
 
+METADATA_TOOLS = [
+    'get_list_documents_by_issue_year',
+    'get_list_documents_by_expiration_year',
+    'get_list_documents_already_expired',
+    'get_list_all_documents_by_organization',
+    'get_list_document_by_expiration_interval'
+]
 
 class JSONEncoder(json.JSONEncoder):
     def default(self, o):
@@ -107,11 +116,69 @@ def format_non_streaming_response(chatCompletion, history_metadata, apim_request
 
     return {}
 
-def format_non_streaming_responseV2(chatCompletion, history_metadata, apim_request_id):
-    if chatCompletion:
+def parse_citation(agent_response: dict) -> dict:
+    '''
+    parse citation from agent response if exist.
+    Args:
+        agent_response(dict): langchane agent responses
+    Return:
+        Citations: Citation format
+    '''
+    try:
+        messages = agent_response.get('messages', [])
+        citations = Citations(citations=[])
+
+        if len(messages) == 0:
+            return citations
+
+        for messages_kind in messages:
+            if messages_kind.type == 'tool' and messages_kind.name in METADATA_TOOLS:
+
+                content = json.loads(messages_kind.content)
+                if len(content) == 0:
+                    continue
+
+                for item in content:
+                    citations.citations.append(Citation(
+                        content=f'```json\n{json.dumps(item, indent=2, ensure_ascii=False)}\n',
+                        title=item['documentTitle'],
+                        url=None,
+                        filepath=item['filepath']
+                    ))
+
+            elif messages_kind.type == 'tool' and \
+                messages_kind.name == 'get_permit_document_content':
+
+                content = json.loads(messages_kind.content)
+                if len(content) == 0:
+                    continue
+
+                for item in content:
+                    citations.citations.append(Citation(
+                        content=item['content'],
+                        title=item['title'],
+                        url=None,
+                        filepath=item['filepath'],
+                        chunk_id=item['chunking_id']
+                    ))
+
+        return citations.model_dump()
+    except Exception as e:
+        print(f"Error parsing agent response: {e}")
+        return Citations(citations=[]).model_dump()
+
+def add_citation_markers_end(assistant_content, citations):
+    """
+    Add all citation markers at the end of the response
+    """
+    markers = ' '.join([f"[doc{i+1}]" for i in range(len(citations))])
+    return f"{assistant_content} {markers}"
+
+def format_non_streaming_responseV2(agent_response, history_metadata, apim_request_id):
+    if agent_response:
         response_obj = {
-            "id": chatCompletion.id,
-            "model": chatCompletion.response_metadata['model_name'],
+            "id": agent_response['messages'][-1].id,
+            "model": agent_response['messages'][-1].response_metadata['model_name'],
             "created": int(time.time()),
             "object": 'chat.completion',
             "choices": [{"messages": []}],
@@ -119,20 +186,20 @@ def format_non_streaming_responseV2(chatCompletion, history_metadata, apim_reque
             "apim-request-id": apim_request_id,
         }
 
-        if chatCompletion.type == 'tool':
-            response_obj["choices"][0]["messages"].append(
-                    {
-                        "role": "tool",
-                        "content": chatCompletion.content,
-                    }
-                )
-
+        citations = parse_citation(agent_response)
         response_obj["choices"][0]["messages"].append(
-            {
-                "role": "assistant",
-                "content": chatCompletion.content,
-            }
-        )
+                {
+                    "role": "tool",
+                    "content": json.dumps(citations),
+                }
+            )
+        assistant_content = add_citation_markers_end(agent_response['messages'][-1].content, citations['citations'])
+        response_obj["choices"][0]["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": assistant_content,
+                }
+            )
 
         return response_obj
 
@@ -270,8 +337,10 @@ def clean_messages(messages: List)-> List:
         return response
 
     for message in messages:
-        if message == {} or message.get('content') == '':
+        if message == {} or message.get('content') == ''\
+            or message.get("role") in ["tool", "function"]:
             continue
         response.append(message)
 
     return response
+
